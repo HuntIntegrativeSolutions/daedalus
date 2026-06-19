@@ -1,0 +1,42 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# Type checkers / editors
+.pyright/
+.idea/
+.vscode/
+
+# OS / filesystem artifacts
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+
+# Packet captures / replay vectors (commit fixtures deliberately, not scratch)
+*.pcap
+*.pcapng
