@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-typecheck:
+    name: Lint & type-check (Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-caching: true
+          python-version: "3.12"
+      - run: uv sync --extra typed --extra oracle
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-caching: true
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --extra typed --extra oracle
+      - run: uv run pytest
+
+  build:
+    name: Build & verify wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-caching: true
+      - run: uv build
+      - name: Assert py.typed in wheel
+        run: |
+          python3 -c "
+          import zipfile, glob, sys
+          whl = glob.glob('dist/*.whl')[0]
+          with zipfile.ZipFile(whl) as z:
+              names = z.namelist()
+          if not any('daedalus/py.typed' in n for n in names):
+              print('ERROR: py.typed not found in wheel')
+              print('Contents:', names)
+              sys.exit(1)
+          print('OK: daedalus/py.typed found in', whl)
+          "

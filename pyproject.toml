@@ -1,0 +1,71 @@
+[build-system]
+requires = ["uv_build>=0.11"]
+build-backend = "uv_build"
+
+[project]
+name = "daedalus"
+version = "0.0.1"
+description = "Unified Allen-Bradley / EtherNet-IP library with a sans-I/O protocol core"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Hunt Integrative Solutions LLC" }]
+keywords = ["plc", "allen-bradley", "ethernet-ip", "cip", "logix", "industrial-automation"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Hardware :: Hardware Drivers",
+]
+dependencies = ["anyio>=4.4"]
+
+[project.optional-dependencies]
+typed  = ["pydantic>=2.7"]
+oracle = ["pycomm3>=1.2", "pylogix>=1.0"]
+# mpy: placeholder for the future MicroPython slim build (L0–L3, no async, no L4/L5)
+mpy    = []
+
+[dependency-groups]
+# PEP 735 — installed by `uv sync` automatically; not shipped to end-users
+dev = [
+    "pytest>=8",
+    "pytest-cov",
+    "hypothesis>=6",
+    "mypy>=1.11",
+    "ruff>=0.6",
+    "pre-commit",
+    "pydantic>=2.7",   # required so the mypy pydantic plugin is importable in dev env
+]
+
+[project.urls]
+Homepage   = "https://github.com/HuntIntegrativeSolutions/daedalus"
+Repository = "https://github.com/HuntIntegrativeSolutions/daedalus"
+Issues     = "https://github.com/HuntIntegrativeSolutions/daedalus/issues"
+
+[tool.ruff]
+target-version = "py311"
+line-length    = 100
+src            = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PTH", "RUF"]
+
+[tool.mypy]
+strict               = true
+python_version       = "3.11"
+files                = ["src", "tests"]
+plugins              = ["pydantic.mypy"]
+warn_unused_ignores  = true
+warn_redundant_casts = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts   = "-q --cov=daedalus --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["daedalus"]
+branch = true

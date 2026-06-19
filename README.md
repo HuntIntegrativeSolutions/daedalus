@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/branding/daedalus-banner.png" alt="daedalus" width="640">
+</p>
+
 # daedalus
 
 A unified Allen-Bradley / EtherNet-IP library for Python, built on a **sans-I/O protocol core**.
@@ -48,3 +52,27 @@ decisions, and testing strategy.
 
 Apache-2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE) (preserves the pycomm3 MIT
 and pylogix Apache-2.0 attributions).
+
+## Development
+
+**Prerequisites:** [uv](https://docs.astral.sh/uv/)
+
+```bash
+# Install all dependencies (base + typed + oracle extras + dev tools)
+uv sync --extra typed --extra oracle
+
+# Install pre-commit hooks
+uv run pre-commit install
+
+# Run tests
+uv run pytest
+
+# Lint
+uv run ruff check .
+
+# Format check
+uv run ruff format --check .
+
+# Type check
+uv run mypy
+```
