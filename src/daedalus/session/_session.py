@@ -76,6 +76,9 @@ class Session:
         self._originator_serial: int = 0
         self._connection_path: bytes = b""
         self._last_fo_was_large: bool = False
+        # Class 3 connected-message sequence counter — reset on each new connection.
+        # Pre-incremented on each use so the first send on a connection yields 1.
+        self._sequence_count: int = 0
 
     # ------------------------------------------------------------------
     # Properties
@@ -115,6 +118,21 @@ class Session:
     def connection_serial(self) -> int:
         """Originator-assigned connection serial number; 0 until CONNECTED."""
         return self._connection_serial
+
+    # ------------------------------------------------------------------
+    # Class 3 sequence counter
+    # ------------------------------------------------------------------
+
+    def next_sequence_count(self) -> int:
+        """Return the next Class 3 connected-message sequence count (1-65535, wrapping).
+
+        Pre-increments before returning so the first send after a Forward_Open
+        always produces sequence count 1, matching real-PLC behaviour.
+        Wraps from 0xFFFF back to 0 then immediately to 1 on the next call
+        (i.e. the counter never stays at 0 during active use).
+        """
+        self._sequence_count = (self._sequence_count + 1) & 0xFFFF
+        return self._sequence_count
 
     # ------------------------------------------------------------------
     # Emit methods — return bytes for the caller to send
@@ -245,6 +263,7 @@ class Session:
             raise
 
         self._ot_connection_id = reply.ot_connection_id
+        self._sequence_count = 0  # reset so first send on this connection yields 1
         self._state = SessionState.CONNECTED
 
     # ------------------------------------------------------------------
@@ -291,6 +310,7 @@ class Session:
             parse_forward_close_reply(frame)
         finally:
             self._ot_connection_id = 0
+            self._sequence_count = 0
             self._state = SessionState.REGISTERED
 
     # ------------------------------------------------------------------

@@ -292,3 +292,96 @@ def test_forward_open_data_matches_pycomm3_large() -> None:
     assert actual == expected, (
         f"Large FO data mismatch:\n  actual  : {actual.hex()}\n  expected: {expected.hex()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2c parity — READ_TAG request bytes and MSP wrapper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "tag_name,element_count",
+    [
+        ("MyTag", 1),
+        ("Program:Main.Counter", 1),
+        ("ArrTag", 5),
+    ],
+    ids=["simple", "dotted-path", "array-elements"],
+)
+def test_read_tag_request_bytes_match_pycomm3(tag_name: str, element_count: int) -> None:
+    """Full READ_TAG CIP request bytes (service + path + element_count) match pycomm3."""
+    import pycomm3.cip.data_types as pc
+    from pycomm3.packets.logix import tag_request_path as p_trp  # type: ignore[attr-defined]
+
+    from daedalus.cip.data_types import UINT as d_UINT
+    from daedalus.cip.services import CIPService
+    from daedalus.packets.cip import build_cip_request
+    from daedalus.packets.cip import tag_request_path as d_trp
+
+    ours = build_cip_request(
+        CIPService.READ_TAG,
+        d_trp(tag_name),
+        d_UINT.encode(element_count),
+    )
+    # pycomm3 tag_only_message equivalent: service + path + UINT(elements)
+    theirs = bytes([0x4C]) + p_trp(tag_name, None, False) + pc.UINT.encode(element_count)  # type: ignore[no-untyped-call]
+
+    assert ours == theirs, (
+        f"READ_TAG request mismatch for '{tag_name}' (count={element_count}):\n"
+        f"  ours  : {ours.hex()}\n"
+        f"  theirs: {theirs.hex()}"
+    )
+
+
+@pytest.mark.parametrize(
+    "tag_names",
+    [
+        ["TagA", "TagB"],
+        ["Program:Main.X", "Program:Main.Y", "Program:Main.Z"],
+    ],
+    ids=["two-tags", "three-dotted-tags"],
+)
+def test_msp_request_bytes_match_pycomm3(tag_names: list[str]) -> None:
+    """MSP request (count word + offset table + sub-requests) matches pycomm3."""
+    import struct as _s
+
+    import pycomm3.cip.data_types as pc
+    from pycomm3.packets.logix import tag_request_path as p_trp  # type: ignore[attr-defined]
+
+    from daedalus.cip.data_types import UINT as d_UINT
+    from daedalus.cip.services import CIPService
+    from daedalus.packets.cip import build_cip_request
+    from daedalus.packets.cip import tag_request_path as d_trp
+
+    # Build daedalus MSP payload (same layout as LogixDriver.read_tags)
+    sub_reqs_d = [
+        build_cip_request(CIPService.READ_TAG, d_trp(n), d_UINT.encode(1)) for n in tag_names
+    ]
+    count = len(sub_reqs_d)
+    base = 2 + 2 * count
+    pos = 0
+    offsets: list[int] = []
+    for req in sub_reqs_d:
+        offsets.append(base + pos)
+        pos += len(req)
+    d_msp_data = (
+        _s.pack("<H", count) + b"".join(_s.pack("<H", o) for o in offsets) + b"".join(sub_reqs_d)
+    )
+
+    # Build pycomm3 MSP payload
+    sub_reqs_p = [bytes([0x4C]) + p_trp(n, None, False) + pc.UINT.encode(1) for n in tag_names]  # type: ignore[no-untyped-call]
+    p_base = 2 + 2 * count
+    p_pos = 0
+    p_offsets: list[int] = []
+    for req in sub_reqs_p:
+        p_offsets.append(p_base + p_pos)
+        p_pos += len(req)
+    p_msp_data = (
+        _s.pack("<H", count) + b"".join(_s.pack("<H", o) for o in p_offsets) + b"".join(sub_reqs_p)
+    )
+
+    assert d_msp_data == p_msp_data, (
+        f"MSP data mismatch for {tag_names}:\n"
+        f"  ours  : {d_msp_data.hex()}\n"
+        f"  theirs: {p_msp_data.hex()}"
+    )

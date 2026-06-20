@@ -9,6 +9,39 @@ Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Phase 2c LogixDriver connected tag READ.
+  - `src/daedalus/tag.py` — unified `Tag` result type (`tag_name`, `value`,
+    `type_code`, `status`, `error`); read-only `.type` property (`"DINT"`,
+    `"STRUCT"`, etc.); pycomm3 (`.value/.error/.type`) and pylogix
+    (`.TagName/.Value/.Status`) attribute conventions both satisfied.
+  - `src/daedalus/drivers/_logix.py` — `LogixDriver` (L3, sans-I/O): module-level
+    pure helpers `_extract_connected_cip`, `_decode_read_reply`, `_parse_msp_reply`
+    (Phase 3 reuse point); `read_tag()` with automatic fragmented-read loop
+    (`READ_TAG_FRAGMENTED 0x52`, `UDINT` byte offset); `read_tags()` scalar batch
+    via Multiple Service Request (0x0A); `send_recv: Callable[[bytes], bytes]`
+    injection keeps the module I/O-free (sans-I/O firewall passes).
+  - `src/daedalus/session/_session.py` — Class 3 sequence counter
+    (`next_sequence_count()`; pre-increment, wraps at 0xFFFF; reset on
+    Forward_Open and Forward_Close).
+  - `src/daedalus/__init__.py` — re-exports `Tag`.
+  - `src/daedalus/drivers/__init__.py` — re-exports `LogixDriver`.
+  - `tests/sim/server.py` — extended CipSimServer with SendUnitData (0x70)
+    handler; per-connection state (`ot_connection_id`); Read Tag (0x4C),
+    Read Tag Fragmented (0x52), Multiple Service Packet (0x0A) service handlers;
+    `tag_store` / `frag_threshold` constructor params.
+  - `tests/conftest.py` — `make_tag_server` factory fixture.
+  - `tests/drivers/test_logix_driver.py` — 22 unit tests (no sockets): Tag
+    properties, `_decode_read_reply` helpers, `_parse_msp_reply`, `LogixDriver`
+    single-tag and batch reads including fragmented accumulation and per-tag
+    error capture.
+  - `tests/drivers/test_logix_e2e.py` — 8 end-to-end tests through real TCP +
+    sim: DINT, REAL, array, struct (0x02A0), multi-read (MSP), fragmented,
+    full lifecycle, missing-tag-in-MSP captured not raised.
+  - `tests/session/test_session.py` — 5 sequence-counter tests.
+  - `tests/test_parity_oracle.py` — full READ_TAG byte parity (service + path +
+    element count) and MSP wrapper parity vs. pycomm3 over 5 parametrized cases.
+  - 332 tests total (1 skipped).
+
 - Phase 2b Forward_Open / Large_Forward_Open + fallback.
   - `src/daedalus/packets/forward_open.py` — pure builders and parsers for
     Forward_Open (0x54), Large_Forward_Open (0x5B), and Forward_Close (0x4E);

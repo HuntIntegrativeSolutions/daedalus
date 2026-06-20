@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from typing import Any
 
 import pytest
 
@@ -25,3 +26,30 @@ def sim_server_rejecting_large() -> Generator[CipSimServer, None, None]:
     srv.start()
     yield srv
     srv.stop()
+
+
+@pytest.fixture
+def make_tag_server() -> Generator[Any, None, None]:
+    """Factory fixture: call with a tag store dict to get a started CipSimServer.
+
+    Usage::
+
+        def test_foo(make_tag_server):
+            srv = make_tag_server({"MyTag": (0xC4, DINT.encode(42))})
+            ...
+    """
+    servers: list[CipSimServer] = []
+
+    def factory(
+        tag_store: dict[str, tuple[int, bytes]],
+        frag_threshold: int = 480,
+    ) -> CipSimServer:
+        srv = CipSimServer(tag_store=tag_store, frag_threshold=frag_threshold)
+        srv.start()
+        servers.append(srv)
+        return srv
+
+    yield factory
+
+    for srv in servers:
+        srv.stop()
