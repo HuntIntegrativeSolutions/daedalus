@@ -189,11 +189,16 @@ def test_decode_array() -> None:
 
 
 def test_decode_struct() -> None:
-    # 2-byte struct handle + payload data
-    payload = struct.pack("<H", 0x02A0) + b"\x01\x00" + b"\xde\xad\xbe\xef"
+    # reply_handle (2B) + member data — _decode_read_reply now keeps the FULL
+    # payload (handle prefix + member data) so _maybe_resolve_struct can
+    # extract the reply handle and dispatch to the template pipeline.
+    reply_handle = b"\x01\x00"
+    member_data = b"\xde\xad\xbe\xef"
+    payload = struct.pack("<H", 0x02A0) + reply_handle + member_data
     tag = _decode_read_reply("S", payload, 1)
     assert isinstance(tag.value, bytes)
-    assert tag.value == b"\xde\xad\xbe\xef"
+    # value = reply_handle(2B) + member_data — handle not stripped at this layer
+    assert tag.value == reply_handle + member_data
     assert tag.type == "STRUCT"
 
 
@@ -290,13 +295,15 @@ def test_driver_read_array_success() -> None:
 
 
 def test_driver_read_struct_success() -> None:
+    # Without get_tag_list() the driver has no template info; falls back to raw bytes.
     session = _make_session()
     cip_payload = _make_read_reply(0x02A0, b"\x00\x00" + b"\xab\xcd")
     stub = _stub([_make_connected_reply(cip_payload, seq=1)])
     driver = LogixDriver(session, stub)
     tag = driver.read_tag("S")
+    # Graceful fallback: value is raw bytes (reply_handle + member data)
     assert isinstance(tag.value, bytes)
-    assert tag.type == "STRUCT"
+    assert tag.type == "STRUCT"  # still "STRUCT" since udt_name not resolved
 
 
 def test_driver_read_error_status_raises() -> None:

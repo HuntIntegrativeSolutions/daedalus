@@ -22,17 +22,47 @@ READ_TAG_FRAGMENTED requests at increasing byte offsets).
 from __future__ import annotations
 
 import contextlib
+import math
 import secrets
 import socket
 import struct
 import threading
+from dataclasses import dataclass
 from typing import Any
 
 from daedalus.cip.data_types import STRING
 from daedalus.cip.segments import PADDED_EPATH, DataSegment, LogicalSegment
 from daedalus.packets.encap import CPFItem, CPFTypeCode, EncapsulationHeader, build_cpf, parse_cpf
 
-__all__ = ["CipSimServer"]
+__all__ = ["CipSimServer", "TemplateEntry"]
+
+
+@dataclass
+class TemplateEntry:
+    """Describes a single UDT template served by the sim's template store.
+
+    The ``structure_handle`` is what the sim echoes back in GET_ATTRIBUTE_LIST
+    replies AND in struct read replies (as the 2-byte reply_handle prefix).
+    ``object_definition_size`` is derived automatically from ``template_data``
+    using the inverse of the driver's read-length formula so the driver can
+    read all bytes in one or more continuations.
+    """
+
+    template_data: bytes  # raw bytes: member-info array + null-separated names blob
+    structure_size: int  # struct size in bytes (reported in GET_ATTRIBUTE_LIST attr 5)
+    member_count: int  # number of members (reported in attr 2)
+    structure_handle: int  # echoed in attr 1 AND as reply_handle in struct read replies
+
+    @property
+    def object_definition_size(self) -> int:
+        """Number of 32-bit words covering all template_data bytes.
+
+        Inverse of: bytes_to_read = (object_definition_size * 4) - 21 - offset
+        At offset=0, bytes_to_read >= len(template_data), so:
+            object_definition_size = ceil((len(template_data) + 21) / 4)
+        """
+        return math.ceil((len(self.template_data) + 21) / 4)
+
 
 _HEADER_SIZE: int = 24
 _CMD_REGISTER_SESSION: int = 0x65
@@ -44,10 +74,13 @@ _SVC_FORWARD_OPEN: int = 0x54
 _SVC_LARGE_FORWARD_OPEN: int = 0x5B
 _SVC_FORWARD_CLOSE: int = 0x4E
 
+_SVC_GET_ATTRIBUTE_LIST: int = 0x03
 _SVC_READ_TAG: int = 0x4C
 _SVC_READ_TAG_FRAGMENTED: int = 0x52
 _SVC_MULTIPLE_SERVICE_REQUEST: int = 0x0A
 _SVC_GET_INSTANCE_ATTR_LIST: int = 0x55
+
+_TEMPLATE_CLASS: int = 0x6C
 
 _CIP_SUCCESS: int = 0x00
 _CIP_PARTIAL: int = 0x06
@@ -87,6 +120,8 @@ class CipSimServer:
         frag_threshold: int = 480,
         symbol_store: dict[str, list[dict[str, Any]]] | None = None,
         tag_list_frag_size: int = 300,
+        template_store: dict[int, TemplateEntry] | None = None,
+        template_frag_threshold: int = 480,
     ) -> None:
         self._reject_large_fo = reject_large_fo
         self._tag_store: dict[str, tuple[int, bytes]] = tag_store or {}
@@ -95,6 +130,9 @@ class CipSimServer:
         # Each value is a list of dicts with keys: name, instance_id, symbol_type, dims
         self._symbol_store: dict[str, list[dict[str, Any]]] = symbol_store or {}
         self._tag_list_frag_size = tag_list_frag_size
+        # template_store: dict keyed by instance_id (int) → TemplateEntry
+        self._template_store: dict[int, TemplateEntry] = template_store or {}
+        self._template_frag_threshold = template_frag_threshold
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -350,7 +388,11 @@ class CipSimServer:
         session_handle = struct.unpack_from("<I", raw_header, 4)[0]
         sender_context = raw_header[8:16]
 
-        if service == _SVC_READ_TAG:
+        if service == _SVC_GET_ATTRIBUTE_LIST:
+            return self._handle_template_attr(
+                conn, session_handle, sender_context, seq_count, cip_data, conn_state
+            )
+        elif service == _SVC_READ_TAG:
             return self._handle_read_tag(
                 conn, session_handle, sender_context, seq_count, cip_data, conn_state
             )
@@ -397,6 +439,32 @@ class CipSimServer:
                 break
         return ".".join(name_parts) if name_parts else None
 
+    def _extract_class_instance(self, cip_data: bytes) -> tuple[int | None, int | None]:
+        """Extract (class_code, instance_id) from a logical-segment CIP path.
+
+        Returns (None, None) if the path is a tag-name (DataSegment) path.
+        Reuses PADDED_EPATH.decode — same approach as _extract_tag_list_path.
+        """
+        if len(cip_data) < 2:
+            return None, None
+        path_word_count = cip_data[1]
+        path_bytes = cip_data[2 : 2 + path_word_count * 2]
+        try:
+            segments = PADDED_EPATH.decode(path_bytes)
+        except Exception:
+            return None, None
+        class_code: int | None = None
+        instance_id: int | None = None
+        for seg in segments:
+            if isinstance(seg, LogicalSegment):
+                if seg.logical_type == "class_id":
+                    lv = seg.logical_value
+                    class_code = lv if isinstance(lv, int) else int.from_bytes(lv, "little")
+                elif seg.logical_type == "instance_id":
+                    lv = seg.logical_value
+                    instance_id = lv if isinstance(lv, int) else int.from_bytes(lv, "little")
+        return class_code, instance_id
+
     def _handle_read_tag(
         self,
         conn: socket.socket,
@@ -406,7 +474,14 @@ class CipSimServer:
         cip_data: bytes,
         conn_state: dict[str, Any],
     ) -> bool:
-        """Serve a READ_TAG (0x4C) request from the tag store."""
+        """Serve a READ_TAG (0x4C) request — tag store or Template Object."""
+        # Check whether this is a Template Object read (class 0x6C path)
+        class_code, instance_id = self._extract_class_instance(cip_data)
+        if class_code == _TEMPLATE_CLASS and instance_id is not None:
+            return self._handle_template_read(
+                conn, session_handle, sender_context, seq_count, cip_data, instance_id, conn_state
+            )
+
         tag_name = self._extract_tag_name(cip_data)
         if tag_name is None or tag_name not in self._tag_store:
             cip_reply = bytes([_SVC_READ_TAG | 0x80, 0x00, _CIP_ATTR_NOT_SUPPORTED, 0x00])
@@ -636,6 +711,86 @@ class CipSimServer:
 
         status = _CIP_PARTIAL if last_idx < len(eligible) else _CIP_SUCCESS
         cip_reply = bytes([_SVC_GET_INSTANCE_ATTR_LIST | 0x80, 0x00, status, 0x00]) + buf
+        self._send_unit_data_reply(
+            conn, session_handle, sender_context, seq_count, cip_reply, conn_state
+        )
+        return True
+
+    def _handle_template_attr(
+        self,
+        conn: socket.socket,
+        session_handle: int,
+        sender_context: bytes,
+        seq_count: int,
+        cip_data: bytes,
+        conn_state: dict[str, Any],
+    ) -> bool:
+        """Serve GET_ATTRIBUTE_LIST (0x03) on Template Object — return makeup attributes."""
+        _, instance_id = self._extract_class_instance(cip_data)
+        if instance_id is None or instance_id not in self._template_store:
+            cip_reply = bytes([_SVC_GET_ATTRIBUTE_LIST | 0x80, 0x00, _CIP_ATTR_NOT_SUPPORTED, 0x00])
+            self._send_unit_data_reply(
+                conn, session_handle, sender_context, seq_count, cip_reply, conn_state
+            )
+            return True
+
+        entry = self._template_store[instance_id]
+        obj_def = entry.object_definition_size
+        payload = (
+            struct.pack("<H", 4)  # attr count = 4
+            + struct.pack("<H", 4)
+            + struct.pack("<H", 0)
+            + struct.pack("<I", obj_def)
+            + struct.pack("<H", 5)
+            + struct.pack("<H", 0)
+            + struct.pack("<I", entry.structure_size)
+            + struct.pack("<H", 2)
+            + struct.pack("<H", 0)
+            + struct.pack("<H", entry.member_count)
+            + struct.pack("<H", 1)
+            + struct.pack("<H", 0)
+            + struct.pack("<H", entry.structure_handle)
+        )
+        cip_reply = bytes([_SVC_GET_ATTRIBUTE_LIST | 0x80, 0x00, _CIP_SUCCESS, 0x00]) + payload
+        self._send_unit_data_reply(
+            conn, session_handle, sender_context, seq_count, cip_reply, conn_state
+        )
+        return True
+
+    def _handle_template_read(
+        self,
+        conn: socket.socket,
+        session_handle: int,
+        sender_context: bytes,
+        seq_count: int,
+        cip_data: bytes,
+        instance_id: int,
+        conn_state: dict[str, Any],
+    ) -> bool:
+        """Serve READ_TAG (0x4C) on Template Object — stream template data with continuation."""
+        if instance_id not in self._template_store:
+            cip_reply = bytes([_SVC_READ_TAG | 0x80, 0x00, _CIP_ATTR_NOT_SUPPORTED, 0x00])
+            self._send_unit_data_reply(
+                conn, session_handle, sender_context, seq_count, cip_reply, conn_state
+            )
+            return True
+
+        entry = self._template_store[instance_id]
+        # Parse request data: DINT(offset) + UINT(bytes_to_read)
+        path_word_count = cip_data[1]
+        data_start = 2 + path_word_count * 2
+        if len(cip_data) < data_start + 6:
+            return False
+        offset = struct.unpack_from("<i", cip_data, data_start)[0]  # DINT (signed)
+        bytes_requested = struct.unpack_from("<H", cip_data, data_start + 4)[0]
+
+        remaining = entry.template_data[offset:]
+        chunk_size = min(bytes_requested, self._template_frag_threshold)
+        chunk = remaining[:chunk_size]
+        more_data = len(remaining) > chunk_size
+
+        status = _CIP_PARTIAL if more_data else _CIP_SUCCESS
+        cip_reply = bytes([_SVC_READ_TAG | 0x80, 0x00, status, 0x00]) + chunk
         self._send_unit_data_reply(
             conn, session_handle, sender_context, seq_count, cip_reply, conn_state
         )
