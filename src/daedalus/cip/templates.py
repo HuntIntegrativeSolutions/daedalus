@@ -22,10 +22,9 @@ from typing import Any
 
 from daedalus.cip.data_types import (
     Array,
+    DataType,
 )
 from daedalus.exceptions import DataError
-
-from daedalus.cip.data_types import DataType
 
 __all__ = [
     "TEMPLATE_MEMBER_INFO_LEN",
