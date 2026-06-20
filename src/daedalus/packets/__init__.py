@@ -27,15 +27,24 @@ from daedalus.packets.encap import (
     build_cpf,
     parse_cpf,
 )
+from daedalus.packets.forward_open import (
+    ForwardOpenReply,
+    build_forward_close,
+    build_forward_open,
+    parse_forward_close_reply,
+    parse_forward_open_reply,
+)
 
 __all__ = [
     "MSG_ROUTER_PATH",
     "CPFItem",
     "CPFTypeCode",
-    # encap
     "EncapsulationHeader",
+    "ForwardOpenReply",
     "build_cip_request",
     "build_cpf",
+    "build_forward_close",
+    "build_forward_open",
     "build_list_identity",
     "build_register_session",
     "build_send_rr_data",
@@ -45,7 +54,8 @@ __all__ = [
     "get_service_status",
     "parse_cip_response",
     "parse_cpf",
-    # cip message builders
+    "parse_forward_close_reply",
+    "parse_forward_open_reply",
     "request_path",
     "tag_request_path",
     "wrap_unconnected_send",

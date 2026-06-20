@@ -16,3 +16,12 @@ def sim_server() -> Generator[CipSimServer, None, None]:
     srv.start()
     yield srv
     srv.stop()
+
+
+@pytest.fixture
+def sim_server_rejecting_large() -> Generator[CipSimServer, None, None]:
+    """CipSimServer that rejects Large_Forward_Open with CIP status 0x08."""
+    srv = CipSimServer(reject_large_fo=True)
+    srv.start()
+    yield srv
+    srv.stop()

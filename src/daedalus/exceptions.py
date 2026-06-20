@@ -5,6 +5,8 @@ __all__ = [
     "CommError",
     "DaedalusError",
     "DataError",
+    "ForwardOpenError",
+    "LargeForwardOpenRejected",
     "RequestError",
     "ResponseError",
 ]
@@ -38,3 +40,15 @@ class ResponseError(DaedalusError):
 
 class RequestError(DaedalusError):
     """Request could not be built or dispatched."""
+
+
+class ForwardOpenError(ResponseError):
+    """Forward_Open or Large_Forward_Open rejected by the device."""
+
+
+class LargeForwardOpenRejected(ForwardOpenError):
+    """Large_Forward_Open rejected by the device (CIP status 0x08).
+
+    The session has been reset to REGISTERED.  The caller should retry with a
+    standard Forward_Open (large=False).
+    """
