@@ -9,6 +9,39 @@ Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Phase 2b Forward_Open / Large_Forward_Open + fallback.
+  - `src/daedalus/packets/forward_open.py` — pure builders and parsers for
+    Forward_Open (0x54), Large_Forward_Open (0x5B), and Forward_Close (0x4E);
+    `ForwardOpenReply` frozen dataclass; `parse_forward_open_reply()` (with
+    `was_large` flag that raises `LargeForwardOpenRejected` on CIP status 0x08
+    and `ForwardOpenError` for any other non-zero status);
+    `parse_forward_close_reply()`.  Default parameters match pycomm3's static
+    cfg defaults (RPI = 0x00204001 µs, T→O conn ID = 0x71190427, etc.).
+  - `src/daedalus/exceptions.py` — `ForwardOpenError` (ResponseError subclass)
+    and `LargeForwardOpenRejected` (ForwardOpenError subclass, typed signal for
+    the standard-FO fallback path).
+  - `src/daedalus/session/_session.py` — three new states (CONNECTING,
+    CONNECTED, CLOSING); `forward_open_request()` / `forward_open_reply()` /
+    `forward_close_request()` / `forward_close_reply()` with h11-style
+    emit/feed contract; typed fallback: `LargeForwardOpenRejected` resets
+    state to REGISTERED so the caller can immediately retry with
+    `forward_open_request(large=False)` — fallback decision stays in the
+    sans-I/O layer; new properties `connected`, `ot_connection_id`,
+    `connection_serial`.
+  - `tests/sim/server.py` — extended CipSimServer to handle SendRRData (0x6F):
+    dispatches Forward_Open / Large_Forward_Open (success or CIP-status-0x08
+    error via `reject_large_fo=True` flag) and Forward_Close; `build_cpf`-based
+    reply builder.
+  - `tests/conftest.py` — `sim_server_rejecting_large` fixture for fallback tests.
+  - `tests/session/test_forward_open.py` — 26 unit tests covering state
+    transitions, service-byte selection, error-path resets, fallback cycle,
+    full lifecycle.
+  - `tests/transport/test_forward_open_e2e.py` — 5 integration tests (large FO
+    roundtrip, standard FO roundtrip, non-zero O→T connection ID, fallback to
+    standard, FC then unregister).
+  - `tests/test_parity_oracle.py` — two FO parity cases: standard (0x54, UINT
+    net_params) and large (0x5B, UDINT net_params) byte-identical to pycomm3.
+
 - Phase 2a Sync Transport: RegisterSession / UnregisterSession vertical slice.
   - `src/daedalus/session/_session.py` — `Session` sans-I/O state machine
     (`IDLE → REGISTERING → REGISTERED → IDLE`); h11-style emit/feed contract:

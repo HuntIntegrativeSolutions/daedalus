@@ -181,3 +181,114 @@ def test_request_path_matches_pycomm3() -> None:
     d = d_rp(ClassCode.MESSAGE_ROUTER, 0x01)
     p = p_rp(PC_ClassCode.message_router, b"\x01")
     assert d == p, f"request_path mismatch: daedalus={d.hex()}, pycomm3={p.hex()}"
+
+
+# ---------------------------------------------------------------------------
+# Forward_Open data parity — byte-identical to pycomm3's static defaults
+# ---------------------------------------------------------------------------
+#
+# pycomm3 hardcodes these values (before per-connection randomisation):
+#   cid  (T→O conn ID)   = b"\x27\x04\x19\x71" → 0x71190427
+#   csn  (conn serial)   = b"\x27\x04"          → 0x0427
+#   vid  (vendor ID)     = b"\x09\x10"          → 0x1009
+#   vsn  (orig serial)   = b"\x09\x10\x19\x71"  → 0x71191009
+#   RPI                  = b"\x01\x40\x20\x00"  → 0x00204001 µs
+#
+# Sources: pycomm3/cip_driver.py lines 134-137, 378.
+
+
+def test_forward_open_data_matches_pycomm3_standard() -> None:
+    """Standard (0x54) FO data bytes are byte-identical to pycomm3's builder."""
+    import pycomm3.const as pc
+    from pycomm3.cip.data_types import UDINT as pc_UDINT
+    from pycomm3.cip.data_types import UINT as pc_UINT
+
+    from daedalus.packets.cip import MSG_ROUTER_PATH
+    from daedalus.packets.forward_open import _build_forward_open_data
+
+    connection_size = 500
+    rpi = 0x00204001
+    init_net_params = 0b_0100_0010_0000_0000
+    net_params = pc_UINT.encode((connection_size & 0x01FF) | init_net_params)
+    connection_path = MSG_ROUTER_PATH  # PADDED_EPATH bytes — parity already verified
+
+    expected = b"".join(
+        [
+            pc.PRIORITY,
+            pc.TIMEOUT_TICKS,
+            b"\x00\x00\x00\x00",  # O→T conn ID (blank)
+            b"\x27\x04\x19\x71",  # T→O conn ID = 0x71190427 LE (cid default)
+            b"\x27\x04",  # connection serial = 0x0427 LE
+            b"\x09\x10",  # originator vendor ID = 0x1009 LE
+            b"\x09\x10\x19\x71",  # originator serial = 0x71191009 LE (vsn default)
+            pc.TIMEOUT_MULTIPLIER,
+            b"\x00\x00\x00",  # reserved
+            pc_UDINT.encode(rpi),  # O→T RPI
+            net_params,  # O→T net params (UINT)
+            pc_UDINT.encode(rpi),  # T→O RPI
+            net_params,  # T→O net params (UINT)
+            pc.TRANSPORT_CLASS,
+            connection_path,
+        ]
+    )
+    actual = _build_forward_open_data(
+        large=False,
+        connection_size=connection_size,
+        rpi=rpi,
+        to_connection_id=0x71190427,
+        connection_serial=0x0427,
+        originator_vendor_id=0x1009,
+        originator_serial=0x71191009,
+        connection_path=connection_path,
+    )
+    assert actual == expected, (
+        f"Standard FO data mismatch:\n  actual  : {actual.hex()}\n  expected: {expected.hex()}"
+    )
+
+
+def test_forward_open_data_matches_pycomm3_large() -> None:
+    """Large (0x5B) FO data: net_params are UDINT instead of UINT."""
+    import pycomm3.const as pc
+    from pycomm3.cip.data_types import UDINT as pc_UDINT
+
+    from daedalus.packets.cip import MSG_ROUTER_PATH
+    from daedalus.packets.forward_open import _build_forward_open_data
+
+    connection_size = 4000
+    rpi = 0x00204001
+    init_net_params = 0b_0100_0010_0000_0000
+    net_params = pc_UDINT.encode((connection_size & 0xFFFF) | (init_net_params << 16))
+    connection_path = MSG_ROUTER_PATH
+
+    expected = b"".join(
+        [
+            pc.PRIORITY,
+            pc.TIMEOUT_TICKS,
+            b"\x00\x00\x00\x00",
+            b"\x27\x04\x19\x71",
+            b"\x27\x04",
+            b"\x09\x10",
+            b"\x09\x10\x19\x71",
+            pc.TIMEOUT_MULTIPLIER,
+            b"\x00\x00\x00",
+            pc_UDINT.encode(rpi),
+            net_params,  # O→T net params (UDINT for large)
+            pc_UDINT.encode(rpi),
+            net_params,  # T→O net params (UDINT for large)
+            pc.TRANSPORT_CLASS,
+            connection_path,
+        ]
+    )
+    actual = _build_forward_open_data(
+        large=True,
+        connection_size=connection_size,
+        rpi=rpi,
+        to_connection_id=0x71190427,
+        connection_serial=0x0427,
+        originator_vendor_id=0x1009,
+        originator_serial=0x71191009,
+        connection_path=connection_path,
+    )
+    assert actual == expected, (
+        f"Large FO data mismatch:\n  actual  : {actual.hex()}\n  expected: {expected.hex()}"
+    )
