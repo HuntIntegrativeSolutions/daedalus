@@ -130,18 +130,14 @@ class Session:
                 f"register_reply() requires REGISTERING state, current state: {self._state.name}"
             )
         if len(frame) < 24:
-            raise DataError(
-                f"RegisterSession reply too short: {len(frame)} bytes (minimum 24)"
-            )
+            raise DataError(f"RegisterSession reply too short: {len(frame)} bytes (minimum 24)")
         header = EncapsulationHeader.decode(frame)
         if header.command != int(EncapsulationCommand.REGISTER_SESSION):
             raise ResponseError(
                 f"Expected REGISTER_SESSION reply (0x65), got 0x{header.command:02x}"
             )
         if header.status != 0:
-            raise ResponseError(
-                f"RegisterSession failed: encap status 0x{header.status:08x}"
-            )
+            raise ResponseError(f"RegisterSession failed: encap status 0x{header.status:08x}")
         if header.session_handle == 0:
             raise ResponseError("RegisterSession returned session_handle=0")
         self._session_handle = header.session_handle

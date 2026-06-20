@@ -78,13 +78,9 @@ class SyncTcpTransport:
             CommError: if the connection cannot be established.
         """
         try:
-            self._sock = socket.create_connection(
-                (self._host, self._port), timeout=self._timeout
-            )
+            self._sock = socket.create_connection((self._host, self._port), timeout=self._timeout)
         except OSError as exc:
-            raise CommError(
-                f"Cannot connect to {self._host}:{self._port}: {exc}"
-            ) from exc
+            raise CommError(f"Cannot connect to {self._host}:{self._port}: {exc}") from exc
 
     def close(self) -> None:
         """Close the TCP connection. Idempotent; silently ignores errors."""
