@@ -11,7 +11,7 @@ from typing import Any
 
 from daedalus.cip.data_types import DATA_TYPES_BY_CODE
 
-__all__ = ["Tag"]
+__all__ = ["Tag", "TagInfo"]
 
 # CIP type code returned for all UDT / struct reads before template is fetched.
 _STRUCT_TYPE_CODE: int = 0x02A0
@@ -64,3 +64,26 @@ class Tag:
     def Status(self) -> int:
         """Alias for ``status`` (pylogix migration)."""
         return self.status
+
+
+# ---------------------------------------------------------------------------
+# Tag-list result type
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TagInfo:
+    """Result of a tag-list enumeration entry (Get Instance Attribute List).
+
+    For atomic tags: ``data_type`` is the CIP type name (e.g. ``"DINT"``).
+    For struct/UDT tags: ``data_type`` is ``None`` and ``template_instance_id``
+    holds the template ID needed for Phase 2e member resolution.
+    """
+
+    tag_name: str
+    instance_id: int
+    is_struct: bool
+    data_type: str | None
+    template_instance_id: int | None
+    dimensions: tuple[int, ...]
+    scope: str

@@ -82,6 +82,18 @@ disallow_untyped_defs = false
 module = "strategies"
 disallow_untyped_defs = false
 
+[[tool.mypy.overrides]]
+module = "drivers.test_tag_list"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = "drivers.test_tag_list_e2e"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = "drivers.test_tag_list_live"
+disallow_untyped_defs = false
+
 [tool.pytest.ini_options]
 testpaths  = ["tests"]
 pythonpath = ["tests"]

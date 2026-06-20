@@ -9,6 +9,50 @@ Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Phase 2d `LogixDriver.get_tag_list` — controller + program scope tag enumeration.
+  - `src/daedalus/tag.py` — `TagInfo` dataclass: `tag_name`, `instance_id`,
+    `is_struct`, `data_type` (atomic CIP type name or `None` for structs),
+    `template_instance_id` (struct template ID for Phase 2e), `dimensions`
+    (tuple: `()` scalar, `(n,)` 1D, `(n,m)` 2D, `(n,m,k)` 3D), `scope`
+    (`"controller"` or `"Program:Main"`).
+  - `src/daedalus/__init__.py` — re-exports `TagInfo`.
+  - `src/daedalus/drivers/_logix.py` — Get Instance Attribute List (service 0x55)
+    on Symbol Object (class 0x6B); 5 module-level pure helpers (Phase 3 reuse
+    point): `_symbol_object_path`, `_build_tag_list_request`, `_is_system_tag`
+    (exact port of pycomm3 `_isolate_user_tags` — I/O tags `:I`/`:O`/`:C`/`:S`
+    are KEPT, not filtered), `_decode_symbol_type`, `_parse_tag_list_reply`
+    (STRING = UINT-length + bytes, NO word-alignment padding); `get_tag_list()`
+    orchestrates controller + discovered program scopes; `_get_scope_tag_list()`
+    implements the continuation loop (status 0x06 → next at `last_instance+1`,
+    status 0x00 → done); attr 10 (external access) deferred (firmware-gated).
+  - `tests/sim/server.py` — extended `CipSimServer` with `symbol_store` + 
+    `tag_list_frag_size` params; `_serialize_symbol_entry` (STRING.encode, no
+    pad), `_extract_tag_list_path`, `_handle_tag_list` service handlers; full
+    continuation (0x06 when chunk exceeds frag_size) supported.
+  - `tests/conftest.py` — `make_symbol_server` factory fixture.
+  - `tests/drivers/test_tag_list.py` — 24 unit tests: `_parse_tag_list_reply`
+    (scalar, 1D/2D array, struct, program-scope collection, odd-length name
+    parsing); `_is_system_tag` (9 cases including I/O tag kept, colon catch-all,
+    system-flag bit); `_build_tag_list_request` (service byte, path shape, attr
+    list, continuation instance); `LogixDriver.get_tag_list` stubs (continuation,
+    program scope iteration, error raise, truncated payload).
+  - `tests/drivers/test_tag_list_e2e.py` — 7 end-to-end tests through sim: DINT
+    scalar, 1D array, struct, system tag excluded, program scope, multi-reply
+    continuation assembly, full lifecycle (read_tag + get_tag_list together).
+  - `tests/drivers/test_tag_list_live.py` — 2 env-gated live tests
+    (`DAEDALUS_TEST_PLC=<ip>[/<slot>]`, CI-skipped): basic list shape + replay
+    capture; `test_live_tag_set_parity_vs_pycomm3` diffs daedalus vs pycomm3
+    tag-name sets on the same controller (definitive filter-parity gate).
+  - `tests/fixtures/replay/` — directory for committed replay vectors.
+  - `tests/test_parity_oracle.py` — 4 new parity tests: 3-case parametrized
+    Get Instance Attribute List request bytes (controller scope, program scope,
+    continuation) matched byte-for-byte against pycomm3's base-6 attribute form;
+    parse-parity test verifies daedalus/pycomm3 agree on names/instance_ids/dims
+    from a pycomm3-encoded synthetic payload, I/O tag present in both, system-
+    flagged tag absent from daedalus result.
+  - `pyproject.toml` — 3 new mypy overrides for new test modules.
+  - 367 tests total (3 skipped).
+
 - Phase 2c LogixDriver connected tag READ.
   - `src/daedalus/tag.py` — unified `Tag` result type (`tag_name`, `value`,
     `type_code`, `status`, `error`); read-only `.type` property (`"DINT"`,

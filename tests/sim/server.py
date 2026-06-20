@@ -28,6 +28,8 @@ import struct
 import threading
 from typing import Any
 
+from daedalus.cip.data_types import STRING
+from daedalus.cip.segments import PADDED_EPATH, DataSegment, LogicalSegment
 from daedalus.packets.encap import CPFItem, CPFTypeCode, EncapsulationHeader, build_cpf, parse_cpf
 
 __all__ = ["CipSimServer"]
@@ -45,6 +47,7 @@ _SVC_FORWARD_CLOSE: int = 0x4E
 _SVC_READ_TAG: int = 0x4C
 _SVC_READ_TAG_FRAGMENTED: int = 0x52
 _SVC_MULTIPLE_SERVICE_REQUEST: int = 0x0A
+_SVC_GET_INSTANCE_ATTR_LIST: int = 0x55
 
 _CIP_SUCCESS: int = 0x00
 _CIP_PARTIAL: int = 0x06
@@ -82,10 +85,16 @@ class CipSimServer:
         reject_large_fo: bool = False,
         tag_store: dict[str, tuple[int, bytes]] | None = None,
         frag_threshold: int = 480,
+        symbol_store: dict[str, list[dict[str, Any]]] | None = None,
+        tag_list_frag_size: int = 300,
     ) -> None:
         self._reject_large_fo = reject_large_fo
         self._tag_store: dict[str, tuple[int, bytes]] = tag_store or {}
         self._frag_threshold = frag_threshold
+        # symbol_store: dict keyed by scope ("controller", "Program:Main", etc.)
+        # Each value is a list of dicts with keys: name, instance_id, symbol_type, dims
+        self._symbol_store: dict[str, list[dict[str, Any]]] = symbol_store or {}
+        self._tag_list_frag_size = tag_list_frag_size
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -353,6 +362,10 @@ class CipSimServer:
             return self._handle_msp(
                 conn, session_handle, sender_context, seq_count, cip_data, conn_state
             )
+        elif service == _SVC_GET_INSTANCE_ATTR_LIST:
+            return self._handle_tag_list(
+                conn, session_handle, sender_context, seq_count, cip_data, conn_state
+            )
         else:
             return False
 
@@ -531,6 +544,98 @@ class CipSimServer:
             bytes([_SVC_MULTIPLE_SERVICE_REQUEST | 0x80, 0x00, _CIP_SUCCESS, 0x00])
             + msp_reply_payload
         )
+        self._send_unit_data_reply(
+            conn, session_handle, sender_context, seq_count, cip_reply, conn_state
+        )
+        return True
+
+    def _serialize_symbol_entry(self, entry: dict[str, Any]) -> bytes:
+        """Serialize one symbol store entry to wire bytes.
+
+        Wire layout (no separators, no count word):
+            UDINT  instance_id
+            STRING name  (UINT length + bytes, NO pad byte)
+            UINT   symbol_type
+            UDINT  symbol_address        (0)
+            UDINT  symbol_object_address (0)
+            UDINT  software_control      (0)
+            UDINT  dim1, dim2, dim3
+        """
+        dims: tuple[int, int, int] = entry.get("dims", (0, 0, 0))
+        return (
+            struct.pack("<I", entry["instance_id"])
+            + STRING.encode(entry["name"])
+            + struct.pack("<H", entry["symbol_type"])
+            + struct.pack("<I", 0)  # symbol_address
+            + struct.pack("<I", 0)  # symbol_object_address
+            + struct.pack("<I", 0)  # software_control
+            + struct.pack("<I", dims[0])
+            + struct.pack("<I", dims[1])
+            + struct.pack("<I", dims[2])
+        )
+
+    def _extract_tag_list_path(self, cip_data: bytes) -> tuple[str | None, int]:
+        """Parse scope and start instance from a Get Instance Attribute List request.
+
+        cip_data layout: [0]=service(0x55), [1]=path_word_count, [2..]=path bytes.
+        Returns (program, start_instance).
+        """
+        if len(cip_data) < 2:
+            return None, 0
+        path_word_count = cip_data[1]
+        path_bytes = cip_data[2 : 2 + path_word_count * 2]
+        try:
+            segments = PADDED_EPATH.decode(path_bytes)
+        except Exception:
+            return None, 0
+
+        program: str | None = None
+        for seg in segments:
+            if (
+                isinstance(seg, DataSegment)
+                and isinstance(seg.data, str)
+                and seg.data.startswith("Program:")
+            ):
+                program = seg.data
+                break
+
+        instance: int = 0
+        for seg in segments:
+            if isinstance(seg, LogicalSegment) and seg.logical_type == "instance_id":
+                lv = seg.logical_value
+                instance = lv if isinstance(lv, int) else int.from_bytes(lv, "little")
+                break
+
+        return program, instance
+
+    def _handle_tag_list(
+        self,
+        conn: socket.socket,
+        session_handle: int,
+        sender_context: bytes,
+        seq_count: int,
+        cip_data: bytes,
+        conn_state: dict[str, Any],
+    ) -> bool:
+        """Serve a Get Instance Attribute List (0x55) request from the symbol store."""
+        program, start_instance = self._extract_tag_list_path(cip_data)
+        scope_key = program or "controller"
+        all_entries = self._symbol_store.get(scope_key, [])
+        eligible = [e for e in all_entries if e["instance_id"] >= start_instance]
+
+        buf = b""
+        last_idx = len(eligible)
+        for i, entry in enumerate(eligible):
+            serialized = self._serialize_symbol_entry(entry)
+            if buf and len(buf) + len(serialized) > self._tag_list_frag_size:
+                last_idx = i  # remaining entries start here
+                break
+            buf += serialized
+        else:
+            last_idx = len(eligible)  # all entries fit
+
+        status = _CIP_PARTIAL if last_idx < len(eligible) else _CIP_SUCCESS
+        cip_reply = bytes([_SVC_GET_INSTANCE_ATTR_LIST | 0x80, 0x00, status, 0x00]) + buf
         self._send_unit_data_reply(
             conn, session_handle, sender_context, seq_count, cip_reply, conn_state
         )
