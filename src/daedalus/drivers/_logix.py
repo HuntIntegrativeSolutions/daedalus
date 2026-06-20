@@ -12,16 +12,25 @@ selectors, socketserver, http, urllib, or requests.
 
 from __future__ import annotations
 
+import re
 import struct
 from collections.abc import Callable, Sequence
 from io import BytesIO
-from typing import Any
 
-from daedalus.cip.data_types import DATA_TYPES_BY_CODE, STRING, UDINT, UINT, Array
+from daedalus.cip.data_types import BOOL, DATA_TYPES_BY_CODE, DINT, STRING, UDINT, UINT, Array
 from daedalus.cip.object_library import ClassCode
 from daedalus.cip.segments import PADDED_EPATH, DataSegment, LogicalSegment
 from daedalus.cip.services import CIPService
 from daedalus.cip.status import decode_status
+from daedalus.cip.templates import (
+    RawMember,
+    ResolvedMember,
+    ResolvedTemplate,
+    TemplateAttributes,
+    decode_struct,
+    parse_template_attr_reply,
+    parse_template_data,
+)
 from daedalus.exceptions import BufferEmptyError, DataError, ResponseError
 from daedalus.packets.cip import (
     MSG_ROUTER_PATH,
@@ -41,6 +50,9 @@ _PARTIAL_TRANSFER: int = 0x06
 
 # CIP type code returned for all UDT / struct reads before template is fetched.
 _STRUCT_TYPE_CODE: int = 0x02A0
+
+# Template Object (class 0x6C) — used for UDT template fetching.
+_TEMPLATE_CLASS: int = int(ClassCode.TEMPLATE_OBJECT)
 
 # ---------------------------------------------------------------------------
 # Tag-list constants (Symbol Object class 0x6B, service 0x55)
@@ -100,10 +112,16 @@ def _decode_read_reply(tag_name: str, payload: bytes, element_count: int) -> Tag
 
     # Struct path — check BEFORE the registry lookup; 0x02A0 is not in DATA_TYPES_BY_CODE.
     if type_code == _STRUCT_TYPE_CODE:
-        # Strip the 2-byte structure handle that precedes the member data.
-        # Named-dict decode requires the UDT template and is deferred to Phase 2d.
-        value: Any = bytes(data[2:]) if len(data) >= 2 else bytes(data)
-        return Tag(tag_name=tag_name, value=value, type_code=type_code)
+        if element_count > 1:
+            # array-of-struct: reply would be reply_handle + N*structure_size chunks;
+            # chunking is not yet supported -- raise explicitly rather than mis-decode.
+            raise DataError(
+                f"READ_TAG '{tag_name}': array-of-struct (element_count={element_count}) "
+                "is not supported in Phase 2e; read elements individually."
+            )
+        # Keep full payload (reply_handle prefix + member data).
+        # _maybe_resolve_struct extracts the handle and decodes members.
+        return Tag(tag_name=tag_name, value=bytes(data), type_code=type_code)
 
     dt = DATA_TYPES_BY_CODE.get(type_code)
     if dt is None:
@@ -312,6 +330,99 @@ def _parse_tag_list_reply(payload: bytes, scope: str) -> tuple[list[TagInfo], li
 
 
 # ---------------------------------------------------------------------------
+# Template Object module-level pure helpers (Phase 3 reuse point — no I/O)
+# ---------------------------------------------------------------------------
+
+
+def _template_object_path(instance_id: int) -> bytes:
+    """PADDED_EPATH (with word-count prefix) for Template Object (class 0x6C, instance N)."""
+    return PADDED_EPATH.encode(
+        [
+            LogicalSegment(int(ClassCode.TEMPLATE_OBJECT), "class_id"),
+            LogicalSegment(instance_id, "instance_id"),
+        ],
+        length=True,
+    )
+
+
+def _build_template_attr_request(instance_id: int) -> bytes:
+    """GET_ATTRIBUTE_LIST (0x03) CIP request for template makeup attrs 4, 5, 2, 1."""
+    path = _template_object_path(instance_id)
+    # UINT(count=4) then four UINT attribute numbers in order: 4, 5, 2, 1
+    data = struct.pack("<H", 4) + struct.pack("<HHHH", 4, 5, 2, 1)
+    return build_cip_request(CIPService.GET_ATTRIBUTE_LIST, path, data)
+
+
+def _build_template_read_request(
+    instance_id: int,
+    object_definition_size: int,
+    offset: int,
+) -> bytes:
+    """READ_TAG (0x4C) CIP request for template data at *offset*.
+
+    Length formula (verbatim from pycomm3):
+        bytes_to_read = (object_definition_size * 4) - 21 - offset
+    Request data: DINT(offset) + UINT(bytes_to_read).
+    """
+    path = _template_object_path(instance_id)
+    bytes_to_read = (object_definition_size * 4) - 21 - offset
+    data = DINT.encode(offset) + UINT.encode(bytes_to_read)
+    return build_cip_request(CIPService.READ_TAG, path, data)
+
+
+def _build_atomic_member(
+    name: str,
+    raw: RawMember,
+    dt: type,
+    is_private: bool,
+) -> ResolvedMember:
+    """Create a ResolvedMember for an atomic/array/bool member."""
+    if dt is BOOL:
+        return ResolvedMember(
+            name=name,
+            offset=raw.offset,
+            is_private=is_private,
+            is_bool=True,
+            bit_number=raw.type_info,
+            is_array=False,
+            array_length=0,
+            atomic_type=dt,
+            nested_template=None,
+        )
+    is_array = raw.type_info > 0
+    return ResolvedMember(
+        name=name,
+        offset=raw.offset,
+        is_private=is_private,
+        is_bool=False,
+        bit_number=0,
+        is_array=is_array,
+        array_length=raw.type_info if is_array else 0,
+        atomic_type=dt,
+        nested_template=None,
+    )
+
+
+def _base_names_for(tag_name: str) -> list[str]:
+    """Return candidate base names (longest first) for _tag_info_cache lookup.
+
+    Strips array subscripts ``[N]``, then walks up dotted path segments.
+    Stops before eating into a ``"Program:X"`` scope prefix.
+    """
+    name = re.sub(r"\[\d+\]", "", tag_name)  # strip e.g. [0], [2]
+    candidates = [name]
+    while "." in name:
+        last_dot = name.rfind(".")
+        # Don't eat "Program:X" — check there's no colon-only-in-scope-prefix
+        before_dot = name[:last_dot]
+        if ":" in before_dot and "." not in before_dot.split(":", 1)[1]:
+            break  # would eat the tag name from "Program:X.TagName"
+        name = before_dot
+        candidates.append(name)
+    return candidates
+
+
+# ---------------------------------------------------------------------------
 # LogixDriver — thin orchestration shell
 # ---------------------------------------------------------------------------
 
@@ -343,6 +454,13 @@ class LogixDriver:
     ) -> None:
         self._session = session
         self._send_recv = send_recv
+        # Template caches — populated lazily on first struct read.
+        # _handle_to_instance maps the REPLY handle (observed in a struct read
+        # reply) to the template instance_id.  NOT the makeup structure_handle —
+        # these may differ; name-based resolution is the source of truth.
+        self._template_cache: dict[int, ResolvedTemplate] = {}
+        self._handle_to_instance: dict[int, int] = {}  # reply_handle → instance_id
+        self._tag_info_cache: dict[str, TagInfo] = {}  # tag_name → TagInfo
 
     # ------------------------------------------------------------------
     # Internal
@@ -382,10 +500,12 @@ class LogixDriver:
         _, status, ext, payload = self._send_connected(cip_msg)
 
         if status == _PARTIAL_TRANSFER:
-            return self._read_tag_fragmented(tag_name, element_count, payload)
+            tag = self._read_tag_fragmented(tag_name, element_count, payload)
+            return self._maybe_resolve_struct(tag)
         if status != _SUCCESS:
             raise ResponseError(f"READ_TAG '{tag_name}' failed: {decode_status(status, ext)}")
-        return _decode_read_reply(tag_name, payload, element_count)
+        tag = _decode_read_reply(tag_name, payload, element_count)
+        return self._maybe_resolve_struct(tag)
 
     def _read_tag_fragmented(
         self,
@@ -481,7 +601,8 @@ class LogixDriver:
         if status != _SUCCESS:
             raise ResponseError(f"MSP failed: {decode_status(status, ext)}")
 
-        return _parse_msp_reply(list(tag_names), payload)
+        tags = _parse_msp_reply(list(tag_names), payload)
+        return [self._maybe_resolve_struct(t) for t in tags]
 
     def get_tag_list(self) -> list[TagInfo]:
         """Enumerate all user tags on the controller (controller + program scopes).
@@ -504,6 +625,9 @@ class LogixDriver:
         for prog in programs:
             prog_tags, _ = self._get_scope_tag_list(prog)
             result.extend(prog_tags)
+        # Populate name→TagInfo cache so _maybe_resolve_struct can bootstrap
+        # struct reads by tag name without a pre-cached reply handle.
+        self._tag_info_cache = {t.tag_name: t for t in result}
         return result
 
     def _get_scope_tag_list(self, program: str | None) -> tuple[list[TagInfo], list[str]]:
@@ -536,3 +660,174 @@ class LogixDriver:
             instance = last_instance + 1  # start AFTER last seen instance
 
         return all_tags, all_programs
+
+    # ------------------------------------------------------------------
+    # Template pipeline — fetch, parse, cache, decode
+    # ------------------------------------------------------------------
+
+    def _fetch_template_attrs(self, instance_id: int) -> TemplateAttributes:
+        """Round-trip GET_ATTRIBUTE_LIST on Template Object → TemplateAttributes."""
+        cip_msg = _build_template_attr_request(instance_id)
+        _, status, ext, payload = self._send_connected(cip_msg)
+        if status != _SUCCESS:
+            raise ResponseError(
+                f"GET_ATTRIBUTE_LIST template {instance_id:#x}: {decode_status(status, ext)}"
+            )
+        return parse_template_attr_reply(payload)
+
+    def _fetch_template_data(self, instance_id: int, object_definition_size: int) -> bytes:
+        """Round-trip READ_TAG on Template Object with 0x06 continuation."""
+        offset = 0
+        accumulated = bytearray()
+        while True:
+            cip_msg = _build_template_read_request(instance_id, object_definition_size, offset)
+            _, status, ext, payload = self._send_connected(cip_msg)
+            if status == _PARTIAL_TRANSFER:
+                accumulated.extend(payload)
+                offset += len(payload)
+            elif status == _SUCCESS:
+                accumulated.extend(payload)
+                break
+            else:
+                raise ResponseError(
+                    f"READ_TAG template {instance_id:#x}: {decode_status(status, ext)}"
+                )
+        return bytes(accumulated)
+
+    def _get_template(self, instance_id: int) -> ResolvedTemplate:
+        """Lazily fetch, parse, and cache a ResolvedTemplate.
+
+        Recursive for nested UDTs (Logix UDTs have no cycles so depth-first
+        terminates; the cache deduplicates diamond-shaped nesting).
+
+        Note: does NOT populate _handle_to_instance — that is done by
+        _maybe_resolve_struct using the reply handle observed in a struct read.
+        """
+        if instance_id in self._template_cache:
+            return self._template_cache[instance_id]
+
+        attrs = self._fetch_template_attrs(instance_id)
+        data = self._fetch_template_data(instance_id, attrs.object_definition_size)
+        template_name, member_pairs = parse_template_data(data, attrs, instance_id)
+        is_predefined = instance_id < 0x100 or instance_id > 0xEFF
+
+        resolved_members: list[ResolvedMember] = []
+        for name, raw in member_pairs:
+            resolved_members.append(self._resolve_member(name, raw, is_predefined))
+
+        non_private = [m for m in resolved_members if not m.is_private]
+        is_string = (
+            len(non_private) == 2
+            and [m.name for m in non_private] == ["LEN", "DATA"]
+            and non_private[1].is_array
+            and non_private[1].atomic_type is not None
+            and non_private[1].atomic_type.__name__ == "SINT"
+        )
+        string_length = non_private[1].array_length if is_string else None
+
+        template = ResolvedTemplate(
+            name=template_name,
+            structure_size=attrs.structure_size,
+            structure_handle=attrs.structure_handle,
+            members=resolved_members,
+            is_string=is_string,
+            string_length=string_length,
+        )
+        self._template_cache[instance_id] = template
+        return template
+
+    def _resolve_member(
+        self,
+        name: str,
+        raw: RawMember,
+        is_predefined: bool,
+    ) -> ResolvedMember:
+        """Resolve one RawMember — may call _get_template recursively for struct members."""
+        is_private = (
+            name.startswith("ZZZZZZZZZZ")
+            or name.startswith("__")
+            or (is_predefined and name in {"CTL", "Control"})
+        )
+        typ = raw.typ
+        # Branch 1: full typ is a known atomic type code
+        dt = DATA_TYPES_BY_CODE.get(typ)
+        if dt is not None:
+            return _build_atomic_member(name, raw, dt, is_private)
+        # Branch 2: masked typ (low 12 bits) is a known atomic type code
+        dt = DATA_TYPES_BY_CODE.get(typ & 0x0FFF)
+        if dt is not None:
+            return _build_atomic_member(name, raw, dt, is_private)
+        # Branch 3: nested struct — recurse into driver to fetch that template
+        nested_id = typ & 0x0FFF
+        nested = self._get_template(nested_id)
+        return ResolvedMember(
+            name=name,
+            offset=raw.offset,
+            is_private=is_private,
+            is_bool=False,
+            bit_number=0,
+            is_array=False,
+            array_length=0,
+            atomic_type=None,
+            nested_template=nested,
+        )
+
+    def _maybe_resolve_struct(self, tag: Tag) -> Tag:
+        """Post-process a 0x02A0 Tag: extract reply handle, look up template, decode.
+
+        Resolution is name-based (same approach as pycomm3). The 2-byte reply handle
+        carried in the struct read response is opaque — it is NOT assumed to equal
+        the structure_handle returned by GET_ATTRIBUTE_LIST makeup. After the first
+        name-based resolution the reply handle is cached so subsequent reads of the
+        same UDT type skip the I/O bootstrap.
+
+        Scoped to whole-struct (top-level) reads for Phase 2e.
+        Nested-member-path reads (read_tag("MyTag.Inner")) fall back to raw bytes
+        gracefully — no crash.
+        """
+        if tag.type_code != _STRUCT_TYPE_CODE or tag.error is not None:
+            return tag
+        raw = tag.value
+        if not isinstance(raw, (bytes, bytearray)) or len(raw) < 2:
+            return tag
+        reply_handle = struct.unpack_from("<H", raw, 0)[0]
+        member_data = bytes(raw[2:])
+
+        # Fast-path: reply handle was seen before and mapped to an instance_id.
+        instance_id = self._handle_to_instance.get(reply_handle)
+
+        if instance_id is None:
+            # Name-based bootstrap: strip subscripts, walk up dotted path
+            # segments to find a TagInfo with template_instance_id set.
+            for base in _base_names_for(tag.tag_name):
+                ti = self._tag_info_cache.get(base)
+                if ti is not None and ti.template_instance_id is not None:
+                    self._get_template(ti.template_instance_id)  # populate _template_cache
+                    # Map the REPLY handle we just observed to this instance_id.
+                    instance_id = ti.template_instance_id
+                    self._handle_to_instance[reply_handle] = instance_id
+                    break
+
+        if instance_id is None:
+            # Can't resolve without tag-list info — return raw bytes, no crash.
+            return tag
+
+        template = self._template_cache[instance_id]
+        try:
+            decoded = decode_struct(member_data, template)
+        except Exception as exc:
+            return Tag(
+                tag_name=tag.tag_name,
+                value=None,
+                type_code=tag.type_code,
+                status=0xFF,
+                error=str(exc),
+            )
+        return Tag(
+            tag_name=tag.tag_name,
+            value=decoded,
+            type_code=tag.type_code,
+            status=tag.status,
+            error=tag.error,
+            udt_name=template.name,
+        )

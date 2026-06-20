@@ -33,6 +33,7 @@ class Tag:
     type_code: int
     status: int = 0
     error: str | None = None
+    udt_name: str | None = None  # resolved UDT name; set after template decode
 
     # ------------------------------------------------------------------
     # pycomm3 migration properties
@@ -40,9 +41,9 @@ class Tag:
 
     @property
     def type(self) -> str | None:
-        """CIP type name (e.g. ``"DINT"``); ``"STRUCT"`` for UDTs; ``None`` for unknown."""
+        """CIP type name (e.g. ``"DINT"``); resolved UDT name for structs; ``None`` for unknown."""
         if self.type_code == _STRUCT_TYPE_CODE:
-            return "STRUCT"
+            return self.udt_name or "STRUCT"
         dt = DATA_TYPES_BY_CODE.get(self.type_code)
         return dt.__name__ if dt is not None else None
 

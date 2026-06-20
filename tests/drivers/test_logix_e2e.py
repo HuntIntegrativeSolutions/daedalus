@@ -90,15 +90,18 @@ def test_e2e_read_array(make_tag_server: Any) -> None:
 
 
 def test_e2e_read_struct(make_tag_server: Any) -> None:
-    # Struct payload: 2-byte handle + 4 data bytes
+    # Struct payload: 2-byte reply_handle + 4 member data bytes.
+    # Without get_tag_list() the driver has no template info; it returns raw
+    # bytes (reply_handle + member data) as a graceful fallback.
     struct_bytes = b"\x01\x00" + b"\xde\xad\xbe\xef"
     srv = make_tag_server({"MyUDT": (0x02A0, struct_bytes)})
     session, transport, driver = _open_connection(srv)
     try:
         tag = driver.read_tag("MyUDT")
         assert tag.type == "STRUCT"
+        # Graceful fallback: value = reply_handle(2B) + member_data(4B)
         assert isinstance(tag.value, bytes)
-        assert tag.value == b"\xde\xad\xbe\xef"
+        assert tag.value == struct_bytes
     finally:
         _close_connection(session, transport)
 

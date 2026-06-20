@@ -9,6 +9,36 @@ Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Phase 2e: UDT / Template pipeline — `get_tag_list()` + `read_tag()` on struct tags
+  now returns `{member: value}` dicts with nested UDT, array-member, and BOOL-bit support.
+  - `src/daedalus/cip/templates.py` (new L0): `TemplateAttributes`, `RawMember`,
+    `ResolvedMember`, `ResolvedTemplate` models; `parse_template_attr_reply` (parses
+    GET_ATTRIBUTE_LIST makeup response); `parse_template_data` (one-level member-info +
+    names blob; predefined-type name-pop mirrors pycomm3; `ASCIISTRING82` → `STRING`);
+    `decode_struct` (offset-aware; handles BOOL bit-aliasing, arrays, nested UDTs,
+    string structs; skips private members).
+  - `src/daedalus/tag.py` — `udt_name: str | None` field; `Tag.type` returns resolved
+    UDT name for struct reads (falls back to `"STRUCT"` when unresolved).
+  - `src/daedalus/drivers/_logix.py` — template fetch pipeline: `_build_template_attr_request`
+    (GET_ATTRIBUTE_LIST attrs 4,5,2,1), `_build_template_read_request` (READ_TAG with
+    `(obj_def_size * 4) - 21 - offset` formula, DINT offset type); `_get_template` lazily
+    fetches + parses + caches; `_maybe_resolve_struct` resolves via name-based lookup
+    (`_tag_info_cache → template_instance_id`), caches reply handle, decodes; `get_tag_list`
+    populates `_tag_info_cache`; `element_count > 1` on struct raises `DataError`.
+  - `tests/sim/server.py` — `TemplateEntry` dataclass; `template_store` + continuation
+    support for GET_ATTRIBUTE_LIST and READ_TAG on Template Object (class 0x6C); path
+    parsing via `PADDED_EPATH.decode` (not a byte scanner).
+  - `tests/cip/test_templates.py` — 21 L0 unit tests + Hypothesis round-trip for
+    `parse_template_attr_reply`, `parse_template_data`, `decode_struct`.
+  - `tests/drivers/test_udt_e2e.py` — 9 offline e2e tests: flat UDT, array member,
+    BOOL bits, nested UDT, string, large-template continuation, no-tag-list fallback,
+    MSP batch, array-of-struct guard.
+  - `tests/drivers/test_parity_templates.py` — 13 request-bytes parity tests (hand-derived;
+    no pycomm3 runtime calls).
+  - `tests/drivers/test_udt_live.py` — env-gated live tier (`DAEDALUS_TEST_PLC`);
+    CI-skipped; read-only; asserts decoded dict vs pycomm3 and logs empirical
+    reply_handle vs makeup structure_handle finding.
+
 - Phase 2d `LogixDriver.get_tag_list` — controller + program scope tag enumeration.
   - `src/daedalus/tag.py` — `TagInfo` dataclass: `tag_name`, `instance_id`,
     `is_struct`, `data_type` (atomic CIP type name or `None` for structs),
