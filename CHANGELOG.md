@@ -9,6 +9,22 @@ Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Phase 2a Sync Transport: RegisterSession / UnregisterSession vertical slice.
+  - `src/daedalus/session/_session.py` — `Session` sans-I/O state machine
+    (`IDLE → REGISTERING → REGISTERED → IDLE`); h11-style emit/feed contract:
+    `register_request()` returns bytes to send, `register_reply(frame)` feeds
+    the device's reply back in and advances state, `unregister_request()`
+    resets state immediately (no reply expected per ODVA).
+  - `src/daedalus/transport/_tcp.py` — `SyncTcpTransport`, the first socket in
+    the repo: `send_frame()` / `recv_frame()` byte-mover with looping `recv`
+    and OS-error → `CommError` wrapping; context-manager support.
+  - `tests/sim/server.py` — `CipSimServer`: in-process TCP server on an
+    ephemeral port (daemon thread); assigns cryptographically random session
+    handles and closes the connection on `UnregisterSession` per ODVA.
+  - End-to-end round-trip test proving the sans-I/O contract: `Session` drives
+    `SyncTcpTransport` against `CipSimServer`; 23 new tests covering state
+    transitions, error paths, and transport edge cases.
+
 - Phase 1 L0 wire codec: full EtherNet/IP + CIP codec adapted from pycomm3 (MIT).
   - `src/daedalus/exceptions.py` — `DaedalusError` hierarchy (`CommError`,
     `DataError`, `BufferEmptyError`, `ResponseError`, `RequestError`).
