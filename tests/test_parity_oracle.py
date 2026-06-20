@@ -385,3 +385,159 @@ def test_msp_request_bytes_match_pycomm3(tag_names: list[str]) -> None:
         f"  ours  : {d_msp_data.hex()}\n"
         f"  theirs: {p_msp_data.hex()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2d parity — Get Instance Attribute List request bytes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "program,instance",
+    [
+        (None, 0),  # controller scope, instance 0
+        ("Program:Main", 0),  # program scope
+        (None, 42),  # continuation — instance 42
+    ],
+    ids=["ctrl-inst0", "prog-inst0", "ctrl-inst42"],
+)
+def test_get_tag_list_request_bytes_match_pycomm3(program: Any, instance: int) -> None:
+    """Get Instance Attribute List request bytes match pycomm3 BASE attribute list.
+
+    Attr 10 (external_access) is excluded from both sides — daedalus always uses
+    the base-6 list; pycomm3 only appends attr 10 when revision_major >= 18 (a
+    live, firmware-gated decision).  Parity is asserted on the base-6 form only.
+    """
+    from pycomm3.cip.data_types import PADDED_EPATH as PC_PADDED_EPATH
+    from pycomm3.cip.data_types import UINT as PC_UINT
+    from pycomm3.cip.data_types import DataSegment as PC_DataSegment
+    from pycomm3.cip.data_types import LogicalSegment as PC_LogicalSegment
+    from pycomm3.cip.object_library import ClassCode as PC_ClassCode
+
+    from daedalus.drivers._logix import _build_tag_list_request
+
+    # pycomm3 side — base-6 attributes only (no attr 10)
+    pc_segs: list[Any] = []
+    if program is not None:
+        pc_segs.append(PC_DataSegment(program))
+    pc_segs += [
+        PC_LogicalSegment(PC_ClassCode.symbol_object, "class_id"),
+        PC_LogicalSegment(instance, "instance_id"),
+    ]
+    pc_path = PC_PADDED_EPATH.encode(pc_segs, length=True)
+    pc_attrs = [b"\x01\x00", b"\x02\x00", b"\x03\x00", b"\x05\x00", b"\x06\x00", b"\x08\x00"]
+    theirs = b"\x55" + pc_path + PC_UINT.encode(len(pc_attrs)) + b"".join(pc_attrs)
+
+    # daedalus side
+    ours = _build_tag_list_request(instance, program)
+
+    assert ours == theirs, (
+        f"Get Instance Attribute List request mismatch "
+        f"(program={program!r}, instance={instance}):\n"
+        f"  ours  : {ours.hex()}\n"
+        f"  theirs: {theirs.hex()}"
+    )
+
+
+def test_get_tag_list_parse_matches_pycomm3() -> None:
+    """Parse of a synthetic reply payload produces equivalent tag info to pycomm3.
+
+    Builds a payload with: DINT scalar, 1D array, struct tag, I/O tag, system tag.
+    Encodes the payload using pycomm3's STRING/UDINT/UINT primitives to prove
+    both libraries share the same wire format, then parses with daedalus and
+    manually re-parses with pycomm3 primitives to compare field-by-field.
+
+    Asserts:
+    - daedalus parsed names/instance_ids/dims match pycomm3-decoded values
+    - I/O tag present in daedalus result (kept by _is_system_tag filter)
+    - system-flagged tag absent from daedalus user-tag list
+    """
+    from io import BytesIO as _BytesIO
+
+    from pycomm3.cip.data_types import STRING as PC_STRING
+    from pycomm3.cip.data_types import UDINT as PC_UDINT
+    from pycomm3.cip.data_types import UINT as PC_UINT
+
+    from daedalus.drivers._logix import _is_system_tag, _parse_tag_list_reply
+
+    _ST_DINT_SCALAR = 0x00C4
+    _ST_DINT_1D = 0x20C4
+    _ST_STRUCT = 0x8123
+    _ST_SYSTEM = 0x10C4
+
+    entries: list[dict[str, Any]] = [
+        {"instance_id": 1, "name": "ScalarDINT", "symbol_type": _ST_DINT_SCALAR, "dims": (0, 0, 0)},
+        {"instance_id": 2, "name": "ArrayDINT", "symbol_type": _ST_DINT_1D, "dims": (10, 0, 0)},
+        {"instance_id": 3, "name": "MyUDT", "symbol_type": _ST_STRUCT, "dims": (0, 0, 0)},
+        {"instance_id": 4, "name": "LocalIO:I", "symbol_type": _ST_DINT_SCALAR, "dims": (0, 0, 0)},
+        {"instance_id": 5, "name": "SysTag", "symbol_type": _ST_SYSTEM, "dims": (0, 0, 0)},
+    ]
+
+    # Build payload using pycomm3 primitives (proves shared wire format)
+    payload = b""
+    for e in entries:
+        dims: tuple[int, int, int] = e["dims"]
+        payload += (
+            PC_UDINT.encode(e["instance_id"])
+            + PC_STRING.encode(e["name"])
+            + PC_UINT.encode(e["symbol_type"])
+            + PC_UDINT.encode(0)  # symbol_address
+            + PC_UDINT.encode(0)  # symbol_object_address
+            + PC_UDINT.encode(0)  # software_control
+            + PC_UDINT.encode(dims[0])
+            + PC_UDINT.encode(dims[1])
+            + PC_UDINT.encode(dims[2])
+        )
+
+    # Re-parse with pycomm3 primitives to build expected dict (base-6 attrs, no attr 10)
+    pc_parsed: list[dict[str, Any]] = []
+    stream = _BytesIO(payload)
+    while stream.tell() < len(payload):
+        inst = PC_UDINT.decode(stream)
+        name = PC_STRING.decode(stream)
+        sym_type = PC_UINT.decode(stream)
+        _addr = PC_UDINT.decode(stream)
+        _obj_addr = PC_UDINT.decode(stream)
+        _sw_ctrl = PC_UDINT.decode(stream)
+        d1 = PC_UDINT.decode(stream)
+        d2 = PC_UDINT.decode(stream)
+        d3 = PC_UDINT.decode(stream)
+        pc_parsed.append(
+            {
+                "instance_id": inst,
+                "tag_name": name,
+                "symbol_type": sym_type,
+                "dimensions": [d1, d2, d3],
+            }
+        )
+    pc_by_name = {t["tag_name"]: t for t in pc_parsed}
+
+    # Parse with daedalus (includes all entries before filtering)
+    d_tags, _, _ = _parse_tag_list_reply(payload, "controller")
+    d_by_name = {t.tag_name: t for t in d_tags}
+
+    # Field-by-field comparison for each entry (excluding system-flagged entries
+    # which daedalus filters during parse, but pycomm3 returns raw)
+    for e in entries:
+        name = e["name"]
+        assert name in pc_by_name, f"pycomm3 parsing missed entry '{name}'"
+        p = pc_by_name[name]
+
+        # system-flagged entries are dropped by daedalus during parse
+        if e["symbol_type"] & 0x1000:
+            assert name not in d_by_name, f"system-flagged '{name}' should be filtered"
+            continue
+
+        assert name in d_by_name, f"daedalus missing entry '{name}'"
+        d = d_by_name[name]
+        assert d.instance_id == p["instance_id"], f"instance_id mismatch for '{name}'"
+        pc_dims = tuple(x for x in p["dimensions"] if x)
+        assert d.dimensions == pc_dims, (
+            f"dimensions mismatch for '{name}': daedalus={d.dimensions} pycomm3={pc_dims}"
+        )
+
+    # I/O tag must pass the _is_system_tag filter (io_tag shields the colon rule)
+    assert "LocalIO:I" in d_by_name, "I/O tag 'LocalIO:I' should be kept by _parse_tag_list_reply"
+    assert not _is_system_tag("LocalIO:I", _ST_DINT_SCALAR), (
+        "I/O tag should not be filtered by _is_system_tag"
+    )

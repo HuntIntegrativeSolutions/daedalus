@@ -53,3 +53,37 @@ def make_tag_server() -> Generator[Any, None, None]:
 
     for srv in servers:
         srv.stop()
+
+
+@pytest.fixture
+def make_symbol_server() -> Generator[Any, None, None]:
+    """Factory fixture: call with a symbol_store dict to get a started CipSimServer.
+
+    Usage::
+
+        def test_foo(make_symbol_server):
+            store = {"controller": [{"name": "MyDINT", "instance_id": 1,
+                                     "symbol_type": 0x00C4, "dims": (0, 0, 0)}]}
+            srv = make_symbol_server(store)
+            ...
+    """
+    servers: list[CipSimServer] = []
+
+    def factory(
+        symbol_store: dict[str, list[dict[str, Any]]],
+        tag_list_frag_size: int = 300,
+        **kwargs: Any,
+    ) -> CipSimServer:
+        srv = CipSimServer(
+            symbol_store=symbol_store,
+            tag_list_frag_size=tag_list_frag_size,
+            **kwargs,
+        )
+        srv.start()
+        servers.append(srv)
+        return srv
+
+    yield factory
+
+    for srv in servers:
+        srv.stop()
