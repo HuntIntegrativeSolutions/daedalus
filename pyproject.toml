@@ -62,9 +62,30 @@ plugins              = ["pydantic.mypy"]
 warn_unused_ignores  = true
 warn_redundant_casts = true
 
+[[tool.mypy.overrides]]
+module = "cip.*"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = "packets.*"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = "test_golden_vectors"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = "test_parity_oracle"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = "strategies"
+disallow_untyped_defs = false
+
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts   = "-q --cov=daedalus --cov-report=term-missing"
+testpaths  = ["tests"]
+pythonpath = ["tests"]
+addopts    = "-q --cov=daedalus --cov-report=term-missing"
 
 [tool.coverage.run]
 source = ["daedalus"]

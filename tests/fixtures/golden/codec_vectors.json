@@ -1,0 +1,176 @@
+[
+  {
+    "type": "bool",
+    "description": "BOOL True encodes as 0xFF per CIP spec",
+    "input": true,
+    "hex": "ff"
+  },
+  {
+    "type": "bool",
+    "description": "BOOL False encodes as 0x00",
+    "input": false,
+    "hex": "00"
+  },
+  {
+    "type": "sint",
+    "description": "SINT encode/decode",
+    "input": -1,
+    "hex": "ff"
+  },
+  {
+    "type": "sint",
+    "description": "SINT encode/decode",
+    "input": 127,
+    "hex": "7f"
+  },
+  {
+    "type": "sint",
+    "description": "SINT encode/decode",
+    "input": -128,
+    "hex": "80"
+  },
+  {
+    "type": "int",
+    "description": "INT encode/decode",
+    "input": 1000,
+    "hex": "e803"
+  },
+  {
+    "type": "int",
+    "description": "INT encode/decode",
+    "input": -1,
+    "hex": "ffff"
+  },
+  {
+    "type": "dint",
+    "description": "DINT encode/decode",
+    "input": 305419896,
+    "hex": "78563412"
+  },
+  {
+    "type": "lint",
+    "description": "LINT encode/decode",
+    "input": -2401053089206453570,
+    "hex": "bebafecaefbeadde"
+  },
+  {
+    "type": "usint",
+    "description": "USINT encode/decode",
+    "input": 255,
+    "hex": "ff"
+  },
+  {
+    "type": "usint",
+    "description": "USINT encode/decode",
+    "input": 0,
+    "hex": "00"
+  },
+  {
+    "type": "uint",
+    "description": "UINT encode/decode",
+    "input": 101,
+    "hex": "6500"
+  },
+  {
+    "type": "uint",
+    "description": "UINT encode/decode",
+    "input": 65535,
+    "hex": "ffff"
+  },
+  {
+    "type": "udint",
+    "description": "UDINT encode/decode",
+    "input": 1,
+    "hex": "01000000"
+  },
+  {
+    "type": "ulint",
+    "description": "ULINT encode/decode",
+    "input": 72623859790382856,
+    "hex": "0807060504030201"
+  },
+  {
+    "type": "real",
+    "description": "REAL 1.0",
+    "input": 1.0,
+    "hex": "0000803f"
+  },
+  {
+    "type": "lreal",
+    "description": "LREAL 1.0",
+    "input": 1.0,
+    "hex": "000000000000f03f"
+  },
+  {
+    "type": "string",
+    "description": "STRING hello",
+    "input": "hello",
+    "hex": "050068656c6c6f"
+  },
+  {
+    "type": "short_string",
+    "description": "SHORT_STRING abc",
+    "input": "abc",
+    "hex": "03616263"
+  },
+  {
+    "type": "logical_segment",
+    "description": "8-bit class_id=0x01 packed",
+    "padded": false,
+    "input": {
+      "logical_value": 1,
+      "logical_type": "class_id"
+    },
+    "hex": "2001"
+  },
+  {
+    "type": "logical_segment",
+    "description": "8-bit instance_id=0x01 packed",
+    "padded": false,
+    "input": {
+      "logical_value": 1,
+      "logical_type": "instance_id"
+    },
+    "hex": "2401"
+  },
+  {
+    "type": "logical_segment",
+    "description": "8-bit class_id=0x6B packed",
+    "padded": false,
+    "input": {
+      "logical_value": 107,
+      "logical_type": "class_id"
+    },
+    "hex": "206b"
+  },
+  {
+    "type": "logical_segment",
+    "description": "16-bit instance_id=0x0100 padded",
+    "padded": true,
+    "input": {
+      "logical_value": 256,
+      "logical_type": "instance_id"
+    },
+    "hex": "25000001"
+  },
+  {
+    "type": "data_segment",
+    "description": "DataSegment ANSI symbol tag",
+    "input": "MyTag",
+    "hex": "91054d7954616700"
+  },
+  {
+    "type": "port_segment",
+    "description": "PortSegment backplane slot 0",
+    "input": {
+      "port": 1,
+      "link_address": 0
+    },
+    "hex": "0100"
+  },
+  {
+    "type": "encap_register_session",
+    "description": "RegisterSession request (no session)",
+    "hex": "65000400000000000000000000000000000000000000000001000000"
+  }
+]
