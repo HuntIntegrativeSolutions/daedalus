@@ -13,12 +13,13 @@ from collections.abc import Callable
 import pytest
 
 from daedalus.cip.data_types import DINT, REAL, SINT
+from daedalus.cip.templates import ResolvedMember, ResolvedTemplate
 from daedalus.drivers import LogixDriver
 from daedalus.drivers._logix import _decode_read_reply, _parse_msp_reply
 from daedalus.exceptions import DataError, ResponseError
 from daedalus.packets.encap import CPFItem, CPFTypeCode, EncapsulationHeader, build_cpf
 from daedalus.session import Session
-from daedalus.tag import Tag
+from daedalus.tag import Tag, TagInfo
 
 # ---------------------------------------------------------------------------
 # Frame / reply helpers
@@ -385,3 +386,84 @@ def test_driver_read_tags_msp_outer_error_raises() -> None:
     driver = LogixDriver(session, stub)
     with pytest.raises(ResponseError, match="MSP failed"):
         driver.read_tags(["X"])
+
+
+# ---------------------------------------------------------------------------
+# _maybe_resolve_struct — member-path misparse regression (P1 fix)
+# ---------------------------------------------------------------------------
+
+_WARM_TMPL_ID = 0x0A5B
+
+
+def _make_warm_driver(frames: list[bytes]) -> LogixDriver:
+    """Driver with _tag_info_cache + _template_cache pre-populated (P_DescList / Code:DINT).
+
+    Used to test _maybe_resolve_struct behaviour when the tag list has been fetched.
+    _get_template checks _template_cache first so no I/O occurs during the test.
+    """
+    session = _make_session()
+    tmpl = ResolvedTemplate(
+        name="P_DescList",
+        structure_size=4,
+        structure_handle=_WARM_TMPL_ID,
+        members=[
+            ResolvedMember(
+                name="Code",
+                offset=0,
+                is_private=False,
+                is_bool=False,
+                bit_number=0,
+                is_array=False,
+                array_length=0,
+                atomic_type=DINT,
+                nested_template=None,
+            )
+        ],
+        is_string=False,
+        string_length=0,
+    )
+    driver = LogixDriver(session, _stub(frames))
+    driver._template_cache[_WARM_TMPL_ID] = tmpl
+    driver._tag_info_cache["VFD_101_Fault"] = TagInfo(
+        tag_name="VFD_101_Fault",
+        instance_id=1,
+        is_struct=True,
+        data_type=None,
+        template_instance_id=_WARM_TMPL_ID,
+        dimensions=(1,),
+        scope="controller",
+    )
+    return driver
+
+
+def test_member_path_struct_returns_raw_bytes_not_parent_dict() -> None:
+    """Regression: read_tag("Tag[0].StructMember") must not apply parent struct template."""
+    reply_handle = b"\x42\x00"
+    member_data = b"\x00" * 8          # placeholder bytes (STRING_40 zeros)
+    payload = _make_read_reply(0x02A0, reply_handle + member_data)
+    driver = _make_warm_driver([_make_connected_reply(payload, seq=1)])
+    tag = driver.read_tag("VFD_101_Fault[0].Desc")
+    assert not isinstance(tag.value, dict), "must not misapply parent template to member read"
+    assert isinstance(tag.value, (bytes, bytearray))
+    assert tag.type_code == 0x02A0
+
+
+def test_explicit_index_struct_still_resolves_template() -> None:
+    """Guard against over-correction: read_tag("Tag[0]") (no member) must still decode."""
+    reply_handle = b"\x42\x00"
+    member_data = DINT.encode(99)      # Code = 99
+    payload = _make_read_reply(0x02A0, reply_handle + member_data)
+    driver = _make_warm_driver([_make_connected_reply(payload, seq=1)])
+    tag = driver.read_tag("VFD_101_Fault[0]")
+    assert isinstance(tag.value, dict)
+    assert tag.value.get("Code") == 99
+
+
+def test_atomic_member_read_unaffected_by_struct_guard() -> None:
+    """Atomic-member reads (DINT reply) never reach _maybe_resolve_struct — stays intact."""
+    payload = _make_read_reply(DINT.code, DINT.encode(42))
+    session = _make_session()
+    driver = LogixDriver(session, _stub([_make_connected_reply(payload, seq=1)]))
+    tag = driver.read_tag("VFD_101_Fault[0].Code")
+    assert tag.value == 42
+    assert tag.type == "DINT"

@@ -1143,9 +1143,19 @@ class LogixDriver:
         if instance_id is None:
             # Name-based bootstrap: strip subscripts, walk up dotted path
             # segments to find a TagInfo with template_instance_id set.
+            cleaned = re.sub(r"\[\d+\]", "", tag.tag_name)
             for base in _base_names_for(tag.tag_name):
                 ti = self._tag_info_cache.get(base)
                 if ti is not None and ti.template_instance_id is not None:
+                    if base != cleaned:
+                        # Fallback match: the tag name has a member-path
+                        # suffix beyond this cached struct entry. Applying
+                        # the parent template to the member's own struct
+                        # reply is a misparse — return raw bytes.
+                        # TODO(phase-2g): resolve the member's own template
+                        # for a full decode (e.g. STRING_40 → str), as
+                        # pycomm3 does.
+                        return tag
                     self._get_template(ti.template_instance_id)  # populate _template_cache
                     # Map the REPLY handle we just observed to this instance_id.
                     instance_id = ti.template_instance_id
