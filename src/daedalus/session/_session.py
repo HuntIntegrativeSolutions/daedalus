@@ -230,16 +230,13 @@ class Session:
         # Resolve None sentinels: generate fresh values to prevent 0x0100 on reconnect.
         # Explicit caller-supplied values are honored exactly (parity oracle, tests).
         resolved_conn_id = (
-            to_connection_id if to_connection_id is not None
-            else self._rng.randint(1, 0xFFFFFFFF)
+            to_connection_id if to_connection_id is not None else self._rng.randint(1, 0xFFFFFFFF)
         )
         resolved_serial = (
-            connection_serial if connection_serial is not None
-            else self._rng.randint(1, 0xFFFF)
+            connection_serial if connection_serial is not None else self._rng.randint(1, 0xFFFF)
         )
         resolved_orig_serial = (
-            originator_serial if originator_serial is not None
-            else self._originator_serial_assigned
+            originator_serial if originator_serial is not None else self._originator_serial_assigned
         )
 
         # Store resolved params for use in forward_close_request

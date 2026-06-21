@@ -439,7 +439,7 @@ def _make_warm_driver(frames: list[bytes]) -> LogixDriver:
 def test_member_path_struct_returns_raw_bytes_not_parent_dict() -> None:
     """Regression: read_tag("Tag[0].StructMember") must not apply parent struct template."""
     reply_handle = b"\x42\x00"
-    member_data = b"\x00" * 8          # placeholder bytes (STRING_40 zeros)
+    member_data = b"\x00" * 8  # placeholder bytes (STRING_40 zeros)
     payload = _make_read_reply(0x02A0, reply_handle + member_data)
     driver = _make_warm_driver([_make_connected_reply(payload, seq=1)])
     tag = driver.read_tag("VFD_101_Fault[0].Desc")
@@ -451,7 +451,7 @@ def test_member_path_struct_returns_raw_bytes_not_parent_dict() -> None:
 def test_explicit_index_struct_still_resolves_template() -> None:
     """Guard against over-correction: read_tag("Tag[0]") (no member) must still decode."""
     reply_handle = b"\x42\x00"
-    member_data = DINT.encode(99)      # Code = 99
+    member_data = DINT.encode(99)  # Code = 99
     payload = _make_read_reply(0x02A0, reply_handle + member_data)
     driver = _make_warm_driver([_make_connected_reply(payload, seq=1)])
     tag = driver.read_tag("VFD_101_Fault[0]")

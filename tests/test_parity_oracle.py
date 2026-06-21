@@ -397,7 +397,7 @@ def test_forward_close_reserved_byte_position() -> None:
     PATH_SIZE_OFFSET = 10
     assert fc_data[PATH_SIZE_OFFSET] == MSG_ROUTER_PATH[0], "path_size_byte mismatch"
     assert fc_data[PATH_SIZE_OFFSET + 1] == 0x00, "Reserved byte must be 0x00"
-    assert fc_data[PATH_SIZE_OFFSET + 2:] == MSG_ROUTER_PATH[1:], "path bytes must follow reserved"
+    assert fc_data[PATH_SIZE_OFFSET + 2 :] == MSG_ROUTER_PATH[1:], "path bytes must follow reserved"
 
 
 # ---------------------------------------------------------------------------
