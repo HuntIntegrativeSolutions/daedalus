@@ -9,14 +9,13 @@ produces the same bytes as element-by-element reads (no length prefix).
 from __future__ import annotations
 
 import struct
-from typing import cast
 
 import pytest
 
 from daedalus.cip.data_types import BOOL, DINT, REAL
 from daedalus.cip.services import CIPService
-from daedalus.packets.cip import build_cip_request, tag_request_path
 from daedalus.drivers._logix import _build_write_request, _encode_value
+from daedalus.packets.cip import build_cip_request, tag_request_path
 
 # ---------------------------------------------------------------------------
 # Helpers for hand-derived expected bytes
