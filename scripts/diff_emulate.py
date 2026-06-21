@@ -16,7 +16,6 @@ import argparse
 import json
 import os
 import pathlib
-import random
 import struct
 from dataclasses import dataclass
 from typing import Any
@@ -64,13 +63,8 @@ class DaedalusAdapter:
         self._session.register_reply(self._transport.recv_frame())
 
         conn_path = backplane_path(slot)
-        # Randomise connection identifiers each run so a previous crashed session
-        # (which left its Forward_Open on the controller) never blocks us.
         self._transport.send_frame(self._session.forward_open_request(
             large=False,
-            connection_serial=random.randint(1, 0xFFFF),
-            originator_serial=random.randint(1, 0xFFFFFFFF),
-            to_connection_id=random.randint(1, 0xFFFFFFFF),
             connection_path=conn_path,
         ))
         self._session.forward_open_reply(self._transport.recv_frame())
