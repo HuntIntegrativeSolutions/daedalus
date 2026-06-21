@@ -213,8 +213,8 @@ def _build_forward_close_data(
             UINT.encode(originator_vendor_id),
             UDINT.encode(originator_serial),
             path_size_byte,  # Connection_Path_Size (USINT, in 16-bit words)
-            b"\x00",         # Reserved per CIP Vol 1 Table 3-5.28
-            path_bytes,      # Connection_Path (EPATH)
+            b"\x00",  # Reserved per CIP Vol 1 Table 3-5.28
+            path_bytes,  # Connection_Path (EPATH)
         ]
     )
 

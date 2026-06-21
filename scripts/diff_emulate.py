@@ -10,6 +10,7 @@ Usage:
 
 Env override: set DAEDALUS_TEST_PLC=ip[/slot] to skip CLI args.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -40,6 +41,7 @@ PASS_ = "PASS"
 
 # ── normalised result ─────────────────────────────────────────────────────────
 
+
 @dataclass
 class R:
     value: Any = None
@@ -48,6 +50,7 @@ class R:
 
 
 # ── daedalus adapter ──────────────────────────────────────────────────────────
+
 
 class DaedalusAdapter:
     def __init__(self, ip: str, slot: int) -> None:
@@ -63,10 +66,12 @@ class DaedalusAdapter:
         self._session.register_reply(self._transport.recv_frame())
 
         conn_path = backplane_path(slot)
-        self._transport.send_frame(self._session.forward_open_request(
-            large=False,
-            connection_path=conn_path,
-        ))
+        self._transport.send_frame(
+            self._session.forward_open_request(
+                large=False,
+                connection_path=conn_path,
+            )
+        )
         self._session.forward_open_reply(self._transport.recv_frame())
 
         self.frames: list[dict[str, str]] = []
@@ -88,12 +93,14 @@ class DaedalusAdapter:
         except Exception as exc:
             return R(error=str(exc))
 
-    def write(self, tag: str, value: Any, *, data_type: str | None = None,
-              element_count: int = 1) -> R:
+    def write(
+        self, tag: str, value: Any, *, data_type: str | None = None, element_count: int = 1
+    ) -> R:
         try:
             with self.driver.armed():
-                t = self.driver.write_tag(tag, value, data_type=data_type,
-                                          element_count=element_count)
+                t = self.driver.write_tag(
+                    tag, value, data_type=data_type, element_count=element_count
+                )
             return R(value=t.value, type_str=t.type, error=t.error)
         except Exception as exc:
             return R(error=str(exc))
@@ -120,9 +127,11 @@ class DaedalusAdapter:
 
 # ── pycomm3 adapter ───────────────────────────────────────────────────────────
 
+
 class Pycomm3Adapter:
     def __init__(self, ip: str, slot: int) -> None:
         import pycomm3  # type: ignore[import]
+
         self._plc = pycomm3.LogixDriver(ip, slot=slot)
         self._plc.open()
 
@@ -139,8 +148,9 @@ class Pycomm3Adapter:
         except Exception as exc:
             return R(error=str(exc))
 
-    def write(self, tag: str, value: Any, *, data_type: str | None = None,
-              element_count: int = 1) -> R:
+    def write(
+        self, tag: str, value: Any, *, data_type: str | None = None, element_count: int = 1
+    ) -> R:
         try:
             t = self._plc.write((tag, value))
             if t is None:
@@ -179,15 +189,18 @@ class Pycomm3Adapter:
 
     def close(self) -> None:
         import contextlib
+
         with contextlib.suppress(Exception):
             self._plc.close()
 
 
 # ── pylogix adapter ───────────────────────────────────────────────────────────
 
+
 class PylogixAdapter:
     def __init__(self, ip: str, slot: int) -> None:
         import pylogix  # type: ignore[import]
+
         self._plc = pylogix.PLC(ip_address=ip, slot=slot)
 
     def read(self, tag: str, element_count: int = 1) -> R:
@@ -200,8 +213,9 @@ class PylogixAdapter:
         except Exception as exc:
             return R(error=str(exc))
 
-    def write(self, tag: str, value: Any, *, data_type: str | None = None,
-              element_count: int = 1) -> R:
+    def write(
+        self, tag: str, value: Any, *, data_type: str | None = None, element_count: int = 1
+    ) -> R:
         try:
             r = self._plc.Write(tag, value)
             status = getattr(r, "Status", None)
@@ -220,11 +234,13 @@ class PylogixAdapter:
 
     def close(self) -> None:
         import contextlib
+
         with contextlib.suppress(Exception):
             self._plc.Close()
 
 
 # ── comparison helpers ────────────────────────────────────────────────────────
+
 
 def _f32_bits(v: Any) -> bytes | None:
     try:
@@ -280,8 +296,8 @@ def _values_agree(a: Any, b: Any) -> bool:
 
 # ── report state ──────────────────────────────────────────────────────────────
 
-_findings: list[dict] = []           # P1 / INVESTIGATE / KNOWN_DIFF / FEATURE_GAP
-_matrix: dict[str, dict] = {}        # phase → {status, count}
+_findings: list[dict] = []  # P1 / INVESTIGATE / KNOWN_DIFF / FEATURE_GAP
+_matrix: dict[str, dict] = {}  # phase → {status, count}
 
 
 def _record(phase: str, tag: str, verdict: str, **kw: Any) -> None:
@@ -296,6 +312,7 @@ def _phase_result(phase: str, total: int, issues: int) -> None:
 
 # ── triage ────────────────────────────────────────────────────────────────────
 
+
 def triage(
     phase: str,
     tag: str,
@@ -309,9 +326,14 @@ def triage(
 ) -> str:
     # FEATURE-GAP: daedalus cleanly refused a known-deferred operation
     if dae.error and expected_refusal_key:
-        _record(phase, tag, FEATURE_GAP,
-                reason=EXPECTED_REFUSALS[expected_refusal_key],
-                dae_error=dae.error, note=note)
+        _record(
+            phase,
+            tag,
+            FEATURE_GAP,
+            reason=EXPECTED_REFUSALS[expected_refusal_key],
+            dae_error=dae.error,
+            note=note,
+        )
         return FEATURE_GAP
 
     # daedalus errored unexpectedly
@@ -325,9 +347,17 @@ def triage(
         else:
             verdict = INVESTIGATE
             hyp = "mixed failures — investigate individually"
-        _record(phase, tag, verdict, hypothesis=hyp,
-                dae=repr(dae), pc3=repr(pc3), plx=repr(plx),
-                frames=frames or [], note=note)
+        _record(
+            phase,
+            tag,
+            verdict,
+            hypothesis=hyp,
+            dae=repr(dae),
+            pc3=repr(pc3),
+            plx=repr(plx),
+            frames=frames or [],
+            note=note,
+        )
         return verdict
 
     # daedalus succeeded — compare with oracles
@@ -350,15 +380,22 @@ def triage(
         verdict = INVESTIGATE
         hyp = "mixed disagreement — investigate"
 
-    _record(phase, tag, verdict, hypothesis=hyp,
-            dae={"value": repr(dae.value), "type": dae.type_str},
-            pc3={"value": repr(pc3.value), "type": pc3.type_str, "error": pc3.error},
-            plx={"value": repr(plx.value), "error": plx.error},
-            frames=frames or [], note=note)
+    _record(
+        phase,
+        tag,
+        verdict,
+        hypothesis=hyp,
+        dae={"value": repr(dae.value), "type": dae.type_str},
+        pc3={"value": repr(pc3.value), "type": pc3.type_str, "error": pc3.error},
+        plx={"value": repr(plx.value), "error": plx.error},
+        frames=frames or [],
+        note=note,
+    )
     return verdict
 
 
 # ── tag-list normalisation helpers ────────────────────────────────────────────
+
 
 def _pc3_tag_names(pc3_list) -> set[str]:
     names: set[str] = set()
@@ -386,6 +423,7 @@ def _plx_tag_names(plx_list) -> set[str]:
 
 # ── Phase A: tag list ─────────────────────────────────────────────────────────
 
+
 def phase_a(dae: DaedalusAdapter, pc3: Pycomm3Adapter, plx: PylogixAdapter):
     print("\n═══ Phase A: Tag List ═══")
 
@@ -402,8 +440,10 @@ def phase_a(dae: DaedalusAdapter, pc3: Pycomm3Adapter, plx: PylogixAdapter):
     print(f"  pylogix  : {len(plx_names)} tags")
 
     issues = 0
-    for label, only in [("only in daedalus", dae_names - pc3_names),
-                         ("only in pycomm3",  pc3_names - dae_names)]:
+    for label, only in [
+        ("only in daedalus", dae_names - pc3_names),
+        ("only in pycomm3", pc3_names - dae_names),
+    ]:
         if only:
             sample = sorted(only)[:15]
             print(f"  [!] {label} ({len(only)}): {sample}")
@@ -421,8 +461,8 @@ def phase_a(dae: DaedalusAdapter, pc3: Pycomm3Adapter, plx: PylogixAdapter):
 
 # ── Phase B: scalar reads ─────────────────────────────────────────────────────
 
-def phase_b(dae: DaedalusAdapter, pc3: Pycomm3Adapter, plx: PylogixAdapter,
-            dae_tags) -> None:
+
+def phase_b(dae: DaedalusAdapter, pc3: Pycomm3Adapter, plx: PylogixAdapter, dae_tags) -> None:
     print("\n═══ Phase B: Scalar Reads ═══")
 
     # Build type→tag map from daedalus tag list (atomics only, no arrays, no structs)
@@ -437,8 +477,11 @@ def phase_b(dae: DaedalusAdapter, pc3: Pycomm3Adapter, plx: PylogixAdapter,
     # STRING is a struct in Logix (is_struct=True, data_type=None) — find separately
     str_tag: str | None = None
     for t in dae_tags:
-        if t.is_struct and not t.dimensions and any(
-                kw in t.tag_name.lower() for kw in ("str", "string")):
+        if (
+            t.is_struct
+            and not t.dimensions
+            and any(kw in t.tag_name.lower() for kw in ("str", "string"))
+        ):
             str_tag = t.tag_name
             break
     if str_tag:
@@ -479,18 +522,20 @@ def phase_b(dae: DaedalusAdapter, pc3: Pycomm3Adapter, plx: PylogixAdapter,
 
 # ── Phase C: array reads + fragmented ────────────────────────────────────────
 
-def phase_c(dae: DaedalusAdapter, pc3: Pycomm3Adapter, plx: PylogixAdapter,
-            dae_tags) -> None:
+
+def phase_c(dae: DaedalusAdapter, pc3: Pycomm3Adapter, plx: PylogixAdapter, dae_tags) -> None:
     print("\n═══ Phase C: Array Reads (incl. fragmented) ═══")
 
     # Find DINT and REAL arrays, prefer large ones for fragmented test
     dint_arrays = sorted(
         [t for t in dae_tags if t.data_type == "DINT" and t.dimensions],
-        key=lambda t: t.dimensions[0], reverse=True,
+        key=lambda t: t.dimensions[0],
+        reverse=True,
     )
     real_arrays = sorted(
         [t for t in dae_tags if t.data_type == "REAL" and t.dimensions],
-        key=lambda t: t.dimensions[0], reverse=True,
+        key=lambda t: t.dimensions[0],
+        reverse=True,
     )
 
     issues = 0
@@ -531,8 +576,8 @@ def phase_c(dae: DaedalusAdapter, pc3: Pycomm3Adapter, plx: PylogixAdapter,
 
 # ── Phase D: UDT / struct reads (PRIORITY) ───────────────────────────────────
 
-def phase_d(dae: DaedalusAdapter, pc3: Pycomm3Adapter, plx: PylogixAdapter,
-            dae_tags) -> None:
+
+def phase_d(dae: DaedalusAdapter, pc3: Pycomm3Adapter, plx: PylogixAdapter, dae_tags) -> None:
     print("\n═══ Phase D: UDT / Struct Reads (PRIORITY) ═══")
 
     # get_tag_list() already called; daedalus driver caches templates internally.
@@ -552,8 +597,7 @@ def phase_d(dae: DaedalusAdapter, pc3: Pycomm3Adapter, plx: PylogixAdapter,
         q = plx.read(tag)
         frames = dae.pop_frames()
 
-        v = triage("D", tag, d, p, q, frames=frames,
-                   note=f"tmpl_id={ti.template_instance_id}")
+        v = triage("D", tag, d, p, q, frames=frames, note=f"tmpl_id={ti.template_instance_id}")
         ok = "✓" if v == PASS_ else "✗"
         dae_summary = repr(d.value)[:60] if d.value is not None else f"ERR:{d.error}"
         print(f"  [UDT] {tag:30s}  dae={dae_summary}  {ok} {v}")
@@ -570,9 +614,16 @@ def phase_d(dae: DaedalusAdapter, pc3: Pycomm3Adapter, plx: PylogixAdapter,
         dae.pop_frames()
         d = dae.read(tag, element_count=n)
         frames = dae.pop_frames()
-        v = triage("D", tag, d, R(), R(),
-                   expected_refusal_key="array_of_struct_read", frames=frames,
-                   note=f"array-of-struct dim={n}")
+        v = triage(
+            "D",
+            tag,
+            d,
+            R(),
+            R(),
+            expected_refusal_key="array_of_struct_read",
+            frames=frames,
+            note=f"array-of-struct dim={n}",
+        )
         print(f"  [ARRAY-OF-STRUCT] {tag:30s}  {v}")
         total += 1
 
@@ -580,6 +631,7 @@ def phase_d(dae: DaedalusAdapter, pc3: Pycomm3Adapter, plx: PylogixAdapter,
 
 
 # ── scratch-tag discovery ─────────────────────────────────────────────────────
+
 
 def _find_scratch_candidates(dae_tags) -> dict[str, str | None]:
     """Return {role: tag_name} for each writable atomic role."""
@@ -590,22 +642,26 @@ def _find_scratch_candidates(dae_tags) -> dict[str, str | None]:
         by_type.setdefault(t.data_type.upper(), []).append(t.tag_name)
 
     # Array candidates
-    dint_arrays = [t for t in dae_tags if t.data_type == "DINT" and t.dimensions and
-                   t.dimensions[0] >= 3]
+    dint_arrays = [
+        t for t in dae_tags if t.data_type == "DINT" and t.dimensions and t.dimensions[0] >= 3
+    ]
 
     # Prefer tags with "scratch", "test", "demo", "temp" in name (case-insensitive)
     def _prefer(candidates: list[str]) -> str | None:
         if not candidates:
             return None
-        preferred = [c for c in candidates
-                     if any(kw in c.lower() for kw in ("scratch","test","demo","temp"))]
+        preferred = [
+            c
+            for c in candidates
+            if any(kw in c.lower() for kw in ("scratch", "test", "demo", "temp"))
+        ]
         return preferred[0] if preferred else candidates[0]
 
     candidates: dict[str, str | None] = {
-        "DINT":  _prefer(by_type.get("DINT", [])),
-        "REAL":  _prefer(by_type.get("REAL", [])),
-        "BOOL":  _prefer(by_type.get("BOOL", [])),
-        "INT":   _prefer(by_type.get("INT", []) or by_type.get("SINT", [])),
+        "DINT": _prefer(by_type.get("DINT", [])),
+        "REAL": _prefer(by_type.get("REAL", [])),
+        "BOOL": _prefer(by_type.get("BOOL", [])),
+        "INT": _prefer(by_type.get("INT", []) or by_type.get("SINT", [])),
         "DINT_ARRAY": dint_arrays[0].tag_name if dint_arrays else None,
     }
     return candidates
@@ -633,12 +689,12 @@ def discover_and_confirm_scratch(dae_tags) -> dict[str, str]:
         print("  Skipping write phases.")
         return {}
 
-    confirmed: dict[str, str] = {role: tag for role, tag in candidates.items()
-                                  if tag is not None}
+    confirmed: dict[str, str] = {role: tag for role, tag in candidates.items() if tag is not None}
     return confirmed
 
 
 # ── Phase E: write round-trip ─────────────────────────────────────────────────
+
 
 def phase_e(
     dae: DaedalusAdapter,
@@ -670,16 +726,20 @@ def phase_e(
         snap_dae = d_snap.value
         snap_plx = q_snap.value
         agree = _values_agree(snap_pc3, snap_dae) and _values_agree(snap_pc3, snap_plx)
-        print(f"  SNAP {role} {tag}: pc3={snap_pc3!r}  dae={snap_dae!r}  plx={snap_plx!r}"
-              f"  {'✓' if agree else '[!] MISMATCH at snapshot'}")
+        print(
+            f"  SNAP {role} {tag}: pc3={snap_pc3!r}  dae={snap_dae!r}  plx={snap_plx!r}"
+            f"  {'✓' if agree else '[!] MISMATCH at snapshot'}"
+        )
 
     # Gate: if any snapshot returned None we cannot safely restore that tag → drop it
     snapshot_failures = {role for role, tag in scratch.items() if snapshots.get(tag) is None}
     if snapshot_failures:
         for role in snapshot_failures:
             tag = scratch[role]
-            print(f"  WARNING: snapshot of {role} ({tag}) returned None — "
-                  f"removing from write set (cannot guarantee restore)")
+            print(
+                f"  WARNING: snapshot of {role} ({tag}) returned None — "
+                f"removing from write set (cannot guarantee restore)"
+            )
             del snapshots[tag]
         scratch = {role: tag for role, tag in scratch.items() if role not in snapshot_failures}
         if not scratch:
@@ -728,9 +788,13 @@ def phase_e(
             elif "fragment" in dw.error.lower():
                 expected = "fragmented_write"
 
-            _record("E", tag, FEATURE_GAP if expected else P1,
-                    note=f"daedalus write refused: {dw.error}",
-                    expected_refusal=EXPECTED_REFUSALS.get(expected or "", ""))
+            _record(
+                "E",
+                tag,
+                FEATURE_GAP if expected else P1,
+                note=f"daedalus write refused: {dw.error}",
+                expected_refusal=EXPECTED_REFUSALS.get(expected or "", ""),
+            )
             print(f"    daedalus write: ERR {dw.error!r}")
             if expected:
                 print("    → FEATURE_GAP (expected refusal)")
@@ -745,8 +809,15 @@ def phase_e(
         print(f"    readback pc3={p_rb.value!r}  plx={q_rb.value!r}")
 
         dw_result = R(value=test_val)
-        v1 = triage("E", f"{tag}[dae→pc3+plx]", dw_result, p_rb, q_rb,
-                    frames=frames, note=f"{role} daedalus-write cross-read")
+        v1 = triage(
+            "E",
+            f"{tag}[dae→pc3+plx]",
+            dw_result,
+            p_rb,
+            q_rb,
+            frames=frames,
+            note=f"{role} daedalus-write cross-read",
+        )
         ok1 = "✓" if v1 == PASS_ else "✗"
         print(f"    cross-read verdict: {ok1} {v1}")
         if v1 not in (PASS_, KNOWN_DIFF):
@@ -772,8 +843,15 @@ def phase_e(
             frames2 = dae.pop_frames()
             print(f"    pycomm3 wrote {alt_val!r} → daedalus reads {d_rb2.value!r}")
             expected_result = R(value=alt_val)
-            v2 = triage("E", f"{tag}[pc3→dae]", d_rb2, expected_result, expected_result,
-                        frames=frames2, note=f"{role} pycomm3-write daedalus-read")
+            v2 = triage(
+                "E",
+                f"{tag}[pc3→dae]",
+                d_rb2,
+                expected_result,
+                expected_result,
+                frames=frames2,
+                note=f"{role} pycomm3-write daedalus-read",
+            )
             ok2 = "✓" if v2 == PASS_ else "✗"
             print(f"    daedalus-read-back verdict: {ok2} {v2}")
             if v2 not in (PASS_, KNOWN_DIFF):
@@ -781,9 +859,13 @@ def phase_e(
 
     # STRING write probe — expect FEATURE-GAP (struct write refused)
     # Find any struct tag whose name suggests a STRING, or fall back to first struct
-    str_candidates = [t for t in dae_tags
-                      if t.is_struct and not t.dimensions and
-                      any(kw in t.tag_name.lower() for kw in ("str", "string"))]
+    str_candidates = [
+        t
+        for t in dae_tags
+        if t.is_struct
+        and not t.dimensions
+        and any(kw in t.tag_name.lower() for kw in ("str", "string"))
+    ]
     if not str_candidates:
         # Fall back: any struct tag will trigger the struct-write refusal
         str_candidates = [t for t in dae_tags if t.is_struct and not t.dimensions]
@@ -797,16 +879,21 @@ def phase_e(
         dae.pop_frames()
         sw = dae.write(tag, "TESTVAL", data_type=None)
         dae.driver._policy.allowlist = old_allowlist
-        _record("E", tag, FEATURE_GAP,
-                note="struct/STRING write probe (expect Phase 2g DataError refusal)",
-                dae_error=sw.error,
-                reason=EXPECTED_REFUSALS["struct_write"])
+        _record(
+            "E",
+            tag,
+            FEATURE_GAP,
+            note="struct/STRING write probe (expect Phase 2g DataError refusal)",
+            dae_error=sw.error,
+            reason=EXPECTED_REFUSALS["struct_write"],
+        )
         print(f"\n  [struct write probe] {tag}: dae_error={sw.error!r} → FEATURE_GAP (expected)")
 
     _phase_result("E_write_roundtrip", total, issues)
 
 
 # ── Phase F: error paths ──────────────────────────────────────────────────────
+
 
 def phase_f(
     dae: DaedalusAdapter,
@@ -828,8 +915,15 @@ def phase_f(
     dae_sane = bool(d.error) and "crash" not in (d.error or "").lower()
     print(f"  [nonexistent tag] dae_err={d.error!r}  pc3_err={p.error!r}  plx_err={q.error!r}")
     if not all_error:
-        _record("F", ghost, P1, note="daedalus returned success on nonexistent tag",
-                dae=repr(d), pc3=repr(p), plx=repr(q))
+        _record(
+            "F",
+            ghost,
+            P1,
+            note="daedalus returned success on nonexistent tag",
+            dae=repr(d),
+            pc3=repr(p),
+            plx=repr(q),
+        )
         issues += 1
         print("    → P1: expected error, got success")
     elif not dae_sane:
@@ -862,14 +956,21 @@ def phase_f(
         if dae_sane_f:
             print("    → PASS (daedalus rejected bad type cleanly)")
         elif not dae_refused:
-            _record("F", dint_tag, P1,
-                    note=f"daedalus accepted string value for DINT tag: value={dw.value!r}",
-                    dae=repr(dw), pc3=repr(pw), plx=repr(qw))
+            _record(
+                "F",
+                dint_tag,
+                P1,
+                note=f"daedalus accepted string value for DINT tag: value={dw.value!r}",
+                dae=repr(dw),
+                pc3=repr(pw),
+                plx=repr(qw),
+            )
             issues += 1
             print("    → P1: daedalus did not refuse bad type")
         else:
-            _record("F", dint_tag, P1,
-                    note=f"daedalus error response looks like a crash: {dw.error!r}")
+            _record(
+                "F", dint_tag, P1, note=f"daedalus error response looks like a crash: {dw.error!r}"
+            )
             issues += 1
             print("    → P1: daedalus crashed on bad type instead of clean refusal")
 
@@ -877,6 +978,7 @@ def phase_f(
 
 
 # ── replay capture ────────────────────────────────────────────────────────────
+
 
 def _save_replay(tag: str, operation: str, frames: list[dict]) -> None:
     if not frames:
@@ -886,15 +988,21 @@ def _save_replay(tag: str, operation: str, frames: list[dict]) -> None:
     path = REPLAY_DIR / f"{safe_tag}_{operation}.jsonl"
     with path.open("w") as fh:
         for frame in frames:
-            fh.write(json.dumps({
-                "tag": tag,
-                "operation": operation,
-                "request": frame["request"],
-                "reply": frame["reply"],
-            }) + "\n")
+            fh.write(
+                json.dumps(
+                    {
+                        "tag": tag,
+                        "operation": operation,
+                        "request": frame["request"],
+                        "reply": frame["reply"],
+                    }
+                )
+                + "\n"
+            )
 
 
 # ── final report ──────────────────────────────────────────────────────────────
+
 
 def print_report() -> None:
     p1_bugs = [f for f in _findings if f["verdict"] == P1]
@@ -908,7 +1016,7 @@ def print_report() -> None:
 
     print("\n── Summary Table ──")
     print(f"  {'Phase':<25}  {'Status':<15}  {'Checked':>7}  {'Issues':>6}")
-    print(f"  {'-'*25}  {'-'*15}  {'-'*7}  {'-'*6}")
+    print(f"  {'-' * 25}  {'-' * 15}  {'-' * 7}  {'-' * 6}")
     for phase, info in sorted(_matrix.items()):
         status = info["status"]
         total = info.get("total", 0)
@@ -919,7 +1027,7 @@ def print_report() -> None:
         print(f"\n── P1 Bugs ({len(p1_bugs)}) ──")
         for b in p1_bugs:
             print(f"\n  [P1] Phase={b['phase']}  Tag={b['tag']}")
-            print(f"       {b.get('hypothesis','')}")
+            print(f"       {b.get('hypothesis', '')}")
             if "dae" in b:
                 print(f"       daedalus : {b['dae']}")
             if "pc3" in b:
@@ -938,12 +1046,12 @@ def print_report() -> None:
     if feature_gaps:
         print(f"\n── Feature Gaps ({len(feature_gaps)}) ──")
         for g in feature_gaps:
-            print(f"  [GAP] Phase={g['phase']}  Tag={g['tag']}  {g.get('reason','')}")
+            print(f"  [GAP] Phase={g['phase']}  Tag={g['tag']}  {g.get('reason', '')}")
 
     if investigations:
         print(f"\n── Investigate ({len(investigations)}) ──")
         for i in investigations:
-            print(f"  [?] Phase={i['phase']}  Tag={i['tag']}  {i.get('hypothesis','')}")
+            print(f"  [?] Phase={i['phase']}  Tag={i['tag']}  {i.get('hypothesis', '')}")
 
     if known_diffs:
         print(f"\n── Known Differences between pycomm3/pylogix ({len(known_diffs)}) ──")
@@ -955,6 +1063,7 @@ def print_report() -> None:
 
 # ── entry point ───────────────────────────────────────────────────────────────
 
+
 def _parse_args() -> tuple[str, int]:
     env = os.environ.get("DAEDALUS_TEST_PLC", "")
     if "/" in env:
@@ -964,10 +1073,11 @@ def _parse_args() -> tuple[str, int]:
     else:
         default_ip, default_slot = "10.0.0.11", "0"
 
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--ip",   default=default_ip,       help="Controller IP")
-    parser.add_argument("--slot", default=default_slot,     type=int, help="CIP slot")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--ip", default=default_ip, help="Controller IP")
+    parser.add_argument("--slot", default=default_slot, type=int, help="CIP slot")
     args = parser.parse_args()
     return args.ip, args.slot
 

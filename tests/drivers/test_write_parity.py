@@ -252,8 +252,7 @@ def test_write_tag_bool_scalar_matches_pycomm3() -> None:
         )
         ours = _build_write_request(tag_name, BOOL.code, 1, value_bytes)
         assert ours == theirs, (
-            f"WRITE_TAG BOOL({val!r}) mismatch:\n"
-            f"  ours  : {ours.hex()}\n  theirs: {theirs.hex()}"
+            f"WRITE_TAG BOOL({val!r}) mismatch:\n  ours  : {ours.hex()}\n  theirs: {theirs.hex()}"
         )
 
 
@@ -277,6 +276,5 @@ def test_write_tag_real_scalar_matches_pycomm3() -> None:
         )
         ours = _build_write_request(tag_name, REAL.code, 1, value_bytes)
         assert ours == theirs, (
-            f"WRITE_TAG REAL({val!r}) mismatch:\n"
-            f"  ours  : {ours.hex()}\n  theirs: {theirs.hex()}"
+            f"WRITE_TAG REAL({val!r}) mismatch:\n  ours  : {ours.hex()}\n  theirs: {theirs.hex()}"
         )

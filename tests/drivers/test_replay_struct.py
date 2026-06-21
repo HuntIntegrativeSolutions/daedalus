@@ -10,6 +10,7 @@ decode harness is tracked as Phase 2+ work (see tests/fixtures/replay/README.md)
 Phase 2g follow-up: after member-template resolution is implemented, these tests
 should assert full decode (e.g. STRING_40 Desc → '' not raw bytes).
 """
+
 from __future__ import annotations
 
 import json
@@ -76,11 +77,15 @@ def _make_session() -> Session:
     )
     svc = int(ConnectionManagerService.FORWARD_OPEN)
     cip_reply = bytes([svc | 0x80, 0x00, 0x00, 0x00]) + fo_payload
-    fo_cpf = b"\x00\x00\x00\x00" + b"\x00\x00" + build_cpf(
-        [
-            CPFItem(CPFTypeCode.NULL_ADDRESS),
-            CPFItem(CPFTypeCode.UNCONNECTED_DATA, cip_reply),
-        ]
+    fo_cpf = (
+        b"\x00\x00\x00\x00"
+        + b"\x00\x00"
+        + build_cpf(
+            [
+                CPFItem(CPFTypeCode.NULL_ADDRESS),
+                CPFItem(CPFTypeCode.UNCONNECTED_DATA, cip_reply),
+            ]
+        )
     )
     fo_header = EncapsulationHeader.for_command(
         0x6F, data_length=len(fo_cpf), session_handle=_SESSION_HANDLE
@@ -206,8 +211,7 @@ def test_replay_member_desc_read_returns_raw_bytes_not_parent_dict() -> None:
     tag = driver.read_tag("VFD_101_Fault[0].Desc")
 
     assert not isinstance(tag.value, dict), (
-        "member-path read must not return parent struct dict — "
-        f"got {tag.value!r}"
+        f"member-path read must not return parent struct dict — got {tag.value!r}"
     )
     assert isinstance(tag.value, (bytes, bytearray)), (
         f"expected raw bytes, got {type(tag.value).__name__!r}"
