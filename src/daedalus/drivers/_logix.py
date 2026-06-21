@@ -597,7 +597,12 @@ class LogixDriver:
             element_count: Number of elements to read (1 = scalar; >1 = array slice).
 
         Returns:
-            A Tag with the decoded value.
+            A Tag with the decoded value.  For *array* tags, a bare read (no
+            index) returns element 0 decoded.  For struct arrays this yields
+            the decoded element-0 dict where pycomm3 and pylogix return
+            ``None`` — an intentional capability consistent with atomic-array
+            bare-read behavior.  Use an indexed path (e.g. ``tag_name[2]``)
+            to read a specific element.
 
         Raises:
             ResponseError: Device returned a CIP error status.
