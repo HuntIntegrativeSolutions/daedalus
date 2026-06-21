@@ -259,25 +259,41 @@ def test_parse_template_attr_reply_parity() -> None:
 
 
 def test_template_attr_request_matches_pycomm3_bytes() -> None:
-    """The GET_ATTRIBUTE_LIST request bytes must match pycomm3's approach.
+    """GET_ATTRIBUTE_LIST bytes for Template Object must match pycomm3's approach.
 
-    pycomm3 _get_structure_makeup builds:
-      service=0x03, path=class 0x6C + instance N,
-      data = UINT(4) + UINT(4) + UINT(5) + UINT(2) + UINT(1)
-
-    We verify against a hard-coded byte sequence derived from that spec.
+    Reference assembled from pycomm3 primitives (no I/O) — same pattern as
+    test_get_tag_list_request_bytes_match_pycomm3 in tests/test_parity_oracle.py.
+    pycomm3 _get_structure_makeup uses: service=0x03, path=class 0x6C + instance N,
+    data=UINT(4) + UINT(4) + UINT(5) + UINT(2) + UINT(1).
     """
     pytest.importorskip("pycomm3", reason="pycomm3 oracle not installed")
 
-    # Build expected bytes manually from the spec
-    from daedalus.cip.object_library import ClassCode
-    from daedalus.cip.services import CIPService
-    from daedalus.packets.cip import build_cip_request, request_path
+    from pycomm3.cip.data_types import PADDED_EPATH as PC_PADDED_EPATH
+    from pycomm3.cip.data_types import UINT as PC_UINT
+    from pycomm3.cip.data_types import LogicalSegment as PC_LogicalSegment
 
     instance_id = 0x0100
-    path = request_path(ClassCode.TEMPLATE_OBJECT, instance_id)
-    expected_data = struct.pack("<H", 4) + struct.pack("<HHHH", 4, 5, 2, 1)
-    expected_req = build_cip_request(CIPService.GET_ATTRIBUTE_LIST, path, expected_data)
+
+    # Build path using pycomm3: class 0x6C (Template Object) + instance N
+    pc_path = PC_PADDED_EPATH.encode(
+        [
+            PC_LogicalSegment(0x6C, "class_id"),
+            PC_LogicalSegment(instance_id, "instance_id"),
+        ],
+        length=True,
+    )
+    # Attribute list data: count=4 then attrs 4, 5, 2, 1
+    pc_data = (
+        PC_UINT.encode(4)
+        + PC_UINT.encode(4)
+        + PC_UINT.encode(5)
+        + PC_UINT.encode(2)
+        + PC_UINT.encode(1)
+    )
+    theirs = bytes([0x03]) + pc_path + pc_data
 
     actual_req = _build_template_attr_request(instance_id=instance_id)
-    assert actual_req == expected_req
+    assert actual_req == theirs, (
+        f"GET_ATTRIBUTE_LIST request mismatch:\n"
+        f"  ours  : {actual_req.hex()}\n  theirs: {theirs.hex()}"
+    )

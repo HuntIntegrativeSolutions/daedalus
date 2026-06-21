@@ -6,6 +6,7 @@ selectors, socketserver, http, urllib, or requests. Pure state transitions only.
 
 from __future__ import annotations
 
+import random
 from enum import Enum, auto
 
 from daedalus.cip.services import EncapsulationCommand
@@ -18,13 +19,10 @@ from daedalus.exceptions import (
 from daedalus.packets.cip import MSG_ROUTER_PATH, build_register_session, build_unregister_session
 from daedalus.packets.encap import EncapsulationHeader
 from daedalus.packets.forward_open import (
-    _DEFAULT_CONN_SERIAL,
     _DEFAULT_LARGE_CONN_SIZE,
-    _DEFAULT_ORIG_SERIAL,
     _DEFAULT_ORIG_VENDOR_ID,
     _DEFAULT_RPI_US,
     _DEFAULT_STD_CONN_SIZE,
-    _DEFAULT_TO_CONN_ID,
     build_forward_close,
     build_forward_open,
     parse_forward_close_reply,
@@ -65,7 +63,14 @@ class Session:
     Neither this class nor any module in ``session/`` may touch a socket.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, rng: random.Random | None = None) -> None:
+        # SystemRandom uses os.urandom() — unguessable even without explicit seeding.
+        # Tests inject random.Random(seed) for byte-for-byte reproducibility.
+        self._rng: random.Random = rng if rng is not None else random.SystemRandom()
+        # Generate a stable originator_serial for this Session instance.
+        # Stable across reconnects (identifies this client instance);
+        # connection_serial varies per forward_open_request() call for replay protection.
+        self._originator_serial_assigned: int = self._rng.randint(1, 0xFFFFFFFF)
         self._state: SessionState = SessionState.IDLE
         self._session_handle: int = 0
         # Forward_Open state — zeroed until CONNECTED
@@ -188,10 +193,10 @@ class Session:
         connection_size: int | None = None,
         rpi: int = _DEFAULT_RPI_US,
         connection_path: bytes = MSG_ROUTER_PATH,
-        to_connection_id: int = _DEFAULT_TO_CONN_ID,
-        connection_serial: int = _DEFAULT_CONN_SERIAL,
+        to_connection_id: int | None = None,
+        connection_serial: int | None = None,
         originator_vendor_id: int = _DEFAULT_ORIG_VENDOR_ID,
-        originator_serial: int = _DEFAULT_ORIG_SERIAL,
+        originator_serial: int | None = None,
     ) -> bytes:
         """Return a Forward_Open or Large_Forward_Open SendRRData frame to send.
 
@@ -202,10 +207,15 @@ class Session:
             connection_size: Max payload bytes; defaults to 4000 (large) or 500 (std).
             rpi: Requested Packet Interval in µs.
             connection_path: Encoded PADDED_EPATH for the connection target.
-            to_connection_id: Originator-assigned T→O connection ID.
-            connection_serial: Connection serial (echoed in Forward_Close).
-            originator_vendor_id: Our vendor ID.
-            originator_serial: Our serial number.
+            to_connection_id: Originator-assigned T→O connection ID.  ``None`` (default)
+                generates a fresh random UDINT per call, preventing duplicate-connection
+                rejects (CIP status 0x0100) after an unclean disconnect.
+            connection_serial: Connection serial echoed in Forward_Close.  ``None``
+                (default) generates a fresh random UINT per call.
+            originator_vendor_id: Our vendor ID — kept stable (identifies client type).
+            originator_serial: Our serial number.  ``None`` (default) uses the
+                per-Session value generated at construction time, which is stable
+                across reconnects but unique per Session instance.
 
         Raises:
             RequestError: if not in REGISTERED state.
@@ -217,11 +227,26 @@ class Session:
         if connection_size is None:
             connection_size = _DEFAULT_LARGE_CONN_SIZE if large else _DEFAULT_STD_CONN_SIZE
 
-        # Store params for use in forward_close_request
-        self._to_connection_id = to_connection_id
-        self._connection_serial = connection_serial
+        # Resolve None sentinels: generate fresh values to prevent 0x0100 on reconnect.
+        # Explicit caller-supplied values are honored exactly (parity oracle, tests).
+        resolved_conn_id = (
+            to_connection_id if to_connection_id is not None
+            else self._rng.randint(1, 0xFFFFFFFF)
+        )
+        resolved_serial = (
+            connection_serial if connection_serial is not None
+            else self._rng.randint(1, 0xFFFF)
+        )
+        resolved_orig_serial = (
+            originator_serial if originator_serial is not None
+            else self._originator_serial_assigned
+        )
+
+        # Store resolved params for use in forward_close_request
+        self._to_connection_id = resolved_conn_id
+        self._connection_serial = resolved_serial
         self._originator_vendor_id = originator_vendor_id
-        self._originator_serial = originator_serial
+        self._originator_serial = resolved_orig_serial
         self._connection_path = connection_path
         self._last_fo_was_large = large
 
@@ -231,10 +256,10 @@ class Session:
             large=large,
             connection_size=connection_size,
             rpi=rpi,
-            to_connection_id=to_connection_id,
-            connection_serial=connection_serial,
+            to_connection_id=resolved_conn_id,
+            connection_serial=resolved_serial,
             originator_vendor_id=originator_vendor_id,
-            originator_serial=originator_serial,
+            originator_serial=resolved_orig_serial,
             connection_path=connection_path,
         )
 

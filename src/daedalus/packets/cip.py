@@ -17,7 +17,7 @@ from daedalus.cip.constants import (
 )
 from daedalus.cip.data_types import UDINT, UINT, USINT
 from daedalus.cip.object_library import ClassCode
-from daedalus.cip.segments import PADDED_EPATH, DataSegment, LogicalSegment
+from daedalus.cip.segments import PADDED_EPATH, DataSegment, LogicalSegment, PortSegment
 from daedalus.cip.services import (
     CIPService,
     ConnectionManagerService,
@@ -34,6 +34,7 @@ from daedalus.packets.encap import (
 
 __all__ = [
     "MSG_ROUTER_PATH",
+    "backplane_path",
     "build_cip_request",
     "build_list_identity",
     "build_register_session",
@@ -292,3 +293,19 @@ def get_extended_status(data: bytes, start: int) -> str | None:
 # ---------------------------------------------------------------------------
 
 MSG_ROUTER_PATH: Final[bytes] = request_path(ClassCode.MESSAGE_ROUTER, 0x01)
+
+
+def backplane_path(slot: int) -> bytes:
+    """Return a PADDED_EPATH with word-count prefix for a chassis backplane route.
+
+    Produces: PortSegment(port=1, link=slot) + MessageRouter class/instance.
+    slot=0 → 03 01 00 20 02 24 01  (3 words, 6 path bytes)
+    """
+    return PADDED_EPATH.encode(
+        [
+            PortSegment(port=1, link_address=slot),
+            LogicalSegment(int(ClassCode.MESSAGE_ROUTER), "class_id"),
+            LogicalSegment(0x01, "instance_id"),
+        ],
+        length=True,
+    )

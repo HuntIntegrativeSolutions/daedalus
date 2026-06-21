@@ -190,6 +190,35 @@ def build_forward_open(
     return build_send_rr_data(session_handle, cip_msg)
 
 
+def _build_forward_close_data(
+    *,
+    connection_serial: int,
+    originator_vendor_id: int,
+    originator_serial: int,
+    connection_path: bytes,
+) -> bytes:
+    """Return the raw FC request data bytes (before CIP wrapping).
+
+    Layout per CIP Vol 1 Table 3-5.28:
+      PRIORITY + TIMEOUT_TICKS + UINT(csn) + UINT(vid) + UDINT(vsn)
+      + path_size_byte + 0x00 (Reserved) + path_bytes
+    """
+    path_size_byte = connection_path[:1]
+    path_bytes = connection_path[1:]
+    return b"".join(
+        [
+            PRIORITY,
+            TIMEOUT_TICKS,
+            UINT.encode(connection_serial),
+            UINT.encode(originator_vendor_id),
+            UDINT.encode(originator_serial),
+            path_size_byte,  # Connection_Path_Size (USINT, in 16-bit words)
+            b"\x00",         # Reserved per CIP Vol 1 Table 3-5.28
+            path_bytes,      # Connection_Path (EPATH)
+        ]
+    )
+
+
 def build_forward_close(
     *,
     session_handle: int,
@@ -210,15 +239,11 @@ def build_forward_close(
     Returns:
         Fully-framed SendRRData bytes ready to send.
     """
-    fc_data = b"".join(
-        [
-            PRIORITY,
-            TIMEOUT_TICKS,
-            UINT.encode(connection_serial),
-            UINT.encode(originator_vendor_id),
-            UDINT.encode(originator_serial),
-            connection_path,
-        ]
+    fc_data = _build_forward_close_data(
+        connection_serial=connection_serial,
+        originator_vendor_id=originator_vendor_id,
+        originator_serial=originator_serial,
+        connection_path=connection_path,
     )
     cm_path = request_path(ClassCode.CONNECTION_MANAGER, 0x01)
     cip_msg = bytes([int(ConnectionManagerService.FORWARD_CLOSE)]) + cm_path + fc_data

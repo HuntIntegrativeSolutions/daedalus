@@ -166,6 +166,43 @@ def test_padded_epath_encode_matches_pycomm3() -> None:
     assert d_enc == p_enc
 
 
+def test_backplane_path_matches_pycomm3() -> None:
+    """backplane_path(slot) is byte-identical to pycomm3's PADDED_EPATH for slots 0, 1, 13."""
+    from pycomm3.cip.data_types import PADDED_EPATH as pc_PP
+    from pycomm3.cip.data_types import LogicalSegment as pc_LS
+    from pycomm3.cip.data_types import PortSegment as pc_Port
+
+    from daedalus.packets.cip import backplane_path
+
+    for slot in [0, 1, 13]:
+        expected = pc_PP.encode(
+            [
+                pc_Port(port=1, link_address=slot),
+                pc_LS(0x02, "class_id"),
+                pc_LS(0x01, "instance_id"),
+            ],
+            length=True,
+        )
+        actual = backplane_path(slot)
+        assert actual == expected, (
+            f"backplane_path({slot}) mismatch: {actual.hex()} != {expected.hex()}"
+        )
+        assert actual[0] == 0x03, "word count must be 3"
+        assert actual[1] == 0x01, "port byte must be 1 (backplane)"
+        assert actual[2] == slot, f"link address byte must be {slot}"
+
+
+def test_msg_router_path_unchanged_by_backplane_path() -> None:
+    """MSG_ROUTER_PATH default is not altered by the new backplane_path function."""
+    from pycomm3.cip.data_types import PADDED_EPATH as pc_PP
+    from pycomm3.cip.data_types import LogicalSegment as pc_LS
+
+    from daedalus.packets.cip import MSG_ROUTER_PATH
+
+    expected = pc_PP.encode([pc_LS(0x02, "class_id"), pc_LS(0x01, "instance_id")], length=True)
+    assert expected == MSG_ROUTER_PATH
+
+
 # ---------------------------------------------------------------------------
 # Request path parity
 # ---------------------------------------------------------------------------
@@ -292,6 +329,75 @@ def test_forward_open_data_matches_pycomm3_large() -> None:
     assert actual == expected, (
         f"Large FO data mismatch:\n  actual  : {actual.hex()}\n  expected: {expected.hex()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Forward_Close data parity — byte-identical to pycomm3 primitives + CIP spec
+# ---------------------------------------------------------------------------
+#
+# pycomm3 _forward_close() builds the route_path with pad_length=True, which
+# inserts a null byte after the word-count prefix.  That null byte IS the
+# Reserved byte required by CIP Vol 1 Table 3-5.28.  Using pad_length=True
+# here gives us the strongest offline oracle without needing a live connection.
+
+
+def test_forward_close_data_matches_pycomm3_spec() -> None:
+    """FC data bytes match pycomm3 primitives + CIP Vol 1 Table 3-5.28 layout."""
+    import pycomm3.const as pc
+    from pycomm3.cip.data_types import PADDED_EPATH as pc_PP
+    from pycomm3.cip.data_types import UDINT as pc_UDINT
+    from pycomm3.cip.data_types import UINT as pc_UINT
+    from pycomm3.cip.data_types import LogicalSegment as pc_LS
+
+    from daedalus.packets.cip import MSG_ROUTER_PATH
+    from daedalus.packets.forward_open import _build_forward_close_data
+
+    connection_serial = 0x0427
+    originator_vendor_id = 0x1009
+    originator_serial = 0x71191009
+
+    # pad_length=True inserts 0x00 after the word-count — that is the CIP Reserved byte
+    expected = b"".join(
+        [
+            pc.PRIORITY,
+            pc.TIMEOUT_TICKS,
+            pc_UINT.encode(connection_serial),
+            pc_UINT.encode(originator_vendor_id),
+            pc_UDINT.encode(originator_serial),
+            pc_PP.encode(
+                [pc_LS(0x02, "class_id"), pc_LS(0x01, "instance_id")],
+                length=True,
+                pad_length=True,
+            ),
+        ]
+    )
+    actual = _build_forward_close_data(
+        connection_serial=connection_serial,
+        originator_vendor_id=originator_vendor_id,
+        originator_serial=originator_serial,
+        connection_path=MSG_ROUTER_PATH,
+    )
+    assert actual == expected, (
+        f"FC data mismatch:\n  actual  : {actual.hex()}\n  expected: {expected.hex()}"
+    )
+
+
+def test_forward_close_reserved_byte_position() -> None:
+    """Reserved 0x00 must sit immediately after Connection_Path_Size per CIP Vol 1 Table 3-5.28."""
+    from daedalus.packets.cip import MSG_ROUTER_PATH
+    from daedalus.packets.forward_open import _build_forward_close_data
+
+    fc_data = _build_forward_close_data(
+        connection_serial=0x0427,
+        originator_vendor_id=0x1009,
+        originator_serial=0x71191009,
+        connection_path=MSG_ROUTER_PATH,
+    )
+    # PRIORITY(1) + TICKS(1) + csn(2) + vid(2) + vsn(4) = 10 bytes → path_size at [10]
+    PATH_SIZE_OFFSET = 10
+    assert fc_data[PATH_SIZE_OFFSET] == MSG_ROUTER_PATH[0], "path_size_byte mismatch"
+    assert fc_data[PATH_SIZE_OFFSET + 1] == 0x00, "Reserved byte must be 0x00"
+    assert fc_data[PATH_SIZE_OFFSET + 2:] == MSG_ROUTER_PATH[1:], "path bytes must follow reserved"
 
 
 # ---------------------------------------------------------------------------
