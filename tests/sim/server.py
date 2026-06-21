@@ -77,6 +77,7 @@ _SVC_FORWARD_CLOSE: int = 0x4E
 _SVC_GET_ATTRIBUTE_LIST: int = 0x03
 _SVC_READ_TAG: int = 0x4C
 _SVC_READ_TAG_FRAGMENTED: int = 0x52
+_SVC_WRITE_TAG: int = 0x4D
 _SVC_MULTIPLE_SERVICE_REQUEST: int = 0x0A
 _SVC_GET_INSTANCE_ATTR_LIST: int = 0x55
 
@@ -85,6 +86,7 @@ _TEMPLATE_CLASS: int = 0x6C
 _CIP_SUCCESS: int = 0x00
 _CIP_PARTIAL: int = 0x06
 _CIP_ATTR_NOT_SUPPORTED: int = 0x08
+_CIP_INVALID_ATTR_VALUE: int = 0x09
 
 
 class CipSimServer:
@@ -122,10 +124,12 @@ class CipSimServer:
         tag_list_frag_size: int = 300,
         template_store: dict[int, TemplateEntry] | None = None,
         template_frag_threshold: int = 480,
+        mismatch_tags: set[str] | None = None,
     ) -> None:
         self._reject_large_fo = reject_large_fo
-        self._tag_store: dict[str, tuple[int, bytes]] = tag_store or {}
+        self._tag_store: dict[str, tuple[int, bytes]] = dict(tag_store) if tag_store else {}
         self._frag_threshold = frag_threshold
+        self._mismatch_tags: set[str] = mismatch_tags or set()
         # symbol_store: dict keyed by scope ("controller", "Program:Main", etc.)
         # Each value is a list of dicts with keys: name, instance_id, symbol_type, dims
         self._symbol_store: dict[str, list[dict[str, Any]]] = symbol_store or {}
@@ -392,6 +396,10 @@ class CipSimServer:
             return self._handle_template_attr(
                 conn, session_handle, sender_context, seq_count, cip_data, conn_state
             )
+        elif service == _SVC_WRITE_TAG:
+            return self._handle_write_tag(
+                conn, session_handle, sender_context, seq_count, cip_data, conn_state
+            )
         elif service == _SVC_READ_TAG:
             return self._handle_read_tag(
                 conn, session_handle, sender_context, seq_count, cip_data, conn_state
@@ -504,6 +512,56 @@ class CipSimServer:
                 bytes([_SVC_READ_TAG | 0x80, 0x00, _CIP_SUCCESS, 0x00]) + type_prefix + value_bytes
             )
 
+        self._send_unit_data_reply(
+            conn, session_handle, sender_context, seq_count, cip_reply, conn_state
+        )
+        return True
+
+    def _handle_write_tag(
+        self,
+        conn: socket.socket,
+        session_handle: int,
+        sender_context: bytes,
+        seq_count: int,
+        cip_data: bytes,
+        conn_state: dict[str, Any],
+    ) -> bool:
+        """Serve a WRITE_TAG (0x4D) request.
+
+        Validates the tag name and type code; updates ``_tag_store`` on success.
+        Tags in ``_mismatch_tags`` receive a success ACK but are NOT updated,
+        so a subsequent read-back returns the old value — this exercises the
+        verify-failed path in LogixDriver.write_tag.
+        """
+        tag_name = self._extract_tag_name(cip_data)
+        if tag_name is None or tag_name not in self._tag_store:
+            cip_reply = bytes([_SVC_WRITE_TAG | 0x80, 0x00, _CIP_ATTR_NOT_SUPPORTED, 0x00])
+            self._send_unit_data_reply(
+                conn, session_handle, sender_context, seq_count, cip_reply, conn_state
+            )
+            return True
+
+        path_word_count = cip_data[1]
+        data_start = 2 + path_word_count * 2
+        if len(cip_data) < data_start + 4:
+            return False
+
+        req_type_code = struct.unpack_from("<H", cip_data, data_start)[0]
+        _element_count = struct.unpack_from("<H", cip_data, data_start + 2)[0]
+        value_bytes = cip_data[data_start + 4 :]
+
+        stored_type_code, _ = self._tag_store[tag_name]
+        if req_type_code != stored_type_code:
+            cip_reply = bytes([_SVC_WRITE_TAG | 0x80, 0x00, _CIP_INVALID_ATTR_VALUE, 0x00])
+            self._send_unit_data_reply(
+                conn, session_handle, sender_context, seq_count, cip_reply, conn_state
+            )
+            return True
+
+        if tag_name not in self._mismatch_tags:
+            self._tag_store[tag_name] = (stored_type_code, value_bytes)
+
+        cip_reply = bytes([_SVC_WRITE_TAG | 0x80, 0x00, _CIP_SUCCESS, 0x00])
         self._send_unit_data_reply(
             conn, session_handle, sender_context, seq_count, cip_reply, conn_state
         )

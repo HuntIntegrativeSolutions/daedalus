@@ -2,6 +2,7 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
+from daedalus.runtime.write_policy import InMemorySink, WriteMode, WritePolicy, WriteRecord
 from daedalus.tag import Tag, TagInfo
 
 try:
@@ -9,4 +10,12 @@ try:
 except PackageNotFoundError:
     __version__ = "0.0.0"
 
-__all__ = ["Tag", "TagInfo", "__version__"]
+__all__ = [
+    "InMemorySink",
+    "Tag",
+    "TagInfo",
+    "WriteMode",
+    "WritePolicy",
+    "WriteRecord",
+    "__version__",
+]

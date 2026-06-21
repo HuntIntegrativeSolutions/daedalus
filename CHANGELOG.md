@@ -9,6 +9,43 @@ Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Phase 2f: Atomic + array tag WRITE through the WritePolicy gate.
+  - `src/daedalus/runtime/write_policy.py` (new L4): `WriteMode` enum (`READ_ONLY` /
+    `DRY_RUN` / `ARMED`); frozen `WriteRecord` dataclass (outcome / tag_name / who /
+    when / intended_bytes / old_bytes / reason); `AuditSink` Protocol (durability seam);
+    `InMemorySink` (non-durable default); `default_safety_predicate` (refuses
+    `:S.` / `:S` suffix — GuardLogix heuristic); `WritePolicy` dataclass (mode, allowlist,
+    denylist, critic, who, clock, safety_predicate, sink); `evaluate()` (pre-I/O gate),
+    `audit()`, `get_records()`, `_make_record()`, `deny()`, `_deny_all()` helpers.
+  - `src/daedalus/drivers/_logix.py`: `LogixDriver.__init__` now accepts `policy:
+    WritePolicy | None`; `armed()` context manager (arms on enter, reverts on finally —
+    `write_tag` never self-disarms); `_is_bit_of_word` + `_BIT_INDEX_RE` (refuses
+    trailing-integer-suffix paths — requires RMW, Phase 2g+); `_build_write_request`
+    (WRITE_TAG 0x4D: path + UINT(type_code) + UINT(element_count) + value_bytes);
+    `_encode_value` (per-element, no length prefix); `_resolve_write_type` (kwarg →
+    cache lookup; raises DataError for structs); `write_tag()` (10-step pipeline:
+    bit-of-word guard → policy gate → type resolve → count validate → encode →
+    dry-run exit → stage read → commit → read-back verify in encoded domain →
+    audit); `write_tags()` (all-or-nothing pre-check + one `critic(batch)` call
+    before any commit).
+  - `src/daedalus/__init__.py`: exports `WritePolicy`, `WriteMode`, `WriteRecord`,
+    `InMemorySink`.
+  - `tests/sim/server.py`: `_SVC_WRITE_TAG = 0x4D`; `mismatch_tags` knob (ACKs write
+    but does not update `_tag_store` → exercises verify-failed path); `_handle_write_tag`
+    (validates tag name, type_code match, updates store on success).
+  - `tests/runtime/test_write_policy.py`: 40+ pure unit tests (safety-tag refusal,
+    read-only default, armed/dry-run gates, denylist/allowlist, bit-of-word detection,
+    batch critic, clock injectability, wall-clock default, audit records).
+  - `tests/drivers/test_write_e2e.py`: offline e2e through `CipSimServer` (armed context
+    manager, bit-of-word refusal, dry-run, mismatch/verify-failed, CIP error, critic
+    veto, DINT/BOOL/REAL/array round-trips, struct refused, audit records).
+  - `tests/drivers/test_write_parity.py`: hand-derived WRITE_TAG request-byte parity;
+    confirms no length prefix on arrays; type_code / element_count as UINT16-LE.
+  - `tests/drivers/test_write_live.py`: double-gated live tier (requires both
+    `DAEDALUS_TEST_PLC` and `DAEDALUS_TEST_WRITE_TAG`).
+  - `tests/test_write_firewall.py`: subprocess test — importing `daedalus.drivers._logix`
+    must not pull `anyio` into `sys.modules`.
+
 - Phase 2e: UDT / Template pipeline — `get_tag_list()` + `read_tag()` on struct tags
   now returns `{member: value}` dicts with nested UDT, array-member, and BOOL-bit support.
   - `src/daedalus/cip/templates.py` (new L0): `TemplateAttributes`, `RawMember`,

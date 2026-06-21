@@ -94,6 +94,26 @@ disallow_untyped_defs = false
 module = "drivers.test_tag_list_live"
 disallow_untyped_defs = false
 
+[[tool.mypy.overrides]]
+module = "runtime.test_write_policy"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = "drivers.test_write_e2e"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = "drivers.test_write_parity"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = "drivers.test_write_live"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = "test_write_firewall"
+disallow_untyped_defs = false
+
 [tool.pytest.ini_options]
 testpaths  = ["tests"]
 pythonpath = ["tests"]

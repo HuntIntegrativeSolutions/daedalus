@@ -14,10 +14,22 @@ from __future__ import annotations
 
 import re
 import struct
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
 from io import BytesIO
+from typing import Any
 
-from daedalus.cip.data_types import BOOL, DATA_TYPES_BY_CODE, DINT, STRING, UDINT, UINT, Array
+from daedalus.cip.data_types import (
+    BOOL,
+    DATA_TYPES_BY_CODE,
+    DATA_TYPES_BY_NAME,
+    DINT,
+    STRING,
+    UDINT,
+    UINT,
+    Array,
+    DataType,
+)
 from daedalus.cip.object_library import ClassCode
 from daedalus.cip.segments import PADDED_EPATH, DataSegment, LogicalSegment
 from daedalus.cip.services import CIPService
@@ -40,6 +52,7 @@ from daedalus.packets.cip import (
     tag_request_path,
 )
 from daedalus.packets.encap import CPFTypeCode, parse_cpf
+from daedalus.runtime.write_policy import WriteMode, WritePolicy
 from daedalus.session import Session
 from daedalus.tag import Tag, TagInfo
 
@@ -423,6 +436,97 @@ def _base_names_for(tag_name: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Write-tag module-level pure helpers (Phase 3 reuse point — no I/O, no state)
+# ---------------------------------------------------------------------------
+
+# Matches "MyDINT.3" (bit-of-word index) — trailing dot followed by ONLY digits.
+# "MyStruct.FieldName" does NOT match (FieldName has letters).
+_BIT_INDEX_RE: re.Pattern[str] = re.compile(r"\.\d+$")
+
+
+def _is_bit_of_word(tag_name: str) -> bool:
+    """Return True if the tag name targets a specific bit of a word.
+
+    WRITE_TAG on a bit-index path (e.g. "MyDINT.3") is semantically wrong:
+    the controller interprets the path as a member_id segment and may silently
+    corrupt the rest of the word.  Bit writes require Read-Modify-Write
+    (CIP 0x4E), deferred to Phase 2g+.
+    """
+    return bool(_BIT_INDEX_RE.search(tag_name))
+
+
+def _build_write_request(
+    tag_name: str,
+    type_code: int,
+    element_count: int,
+    value_bytes: bytes,
+) -> bytes:
+    """Build a WRITE_TAG (0x4D) CIP request — pure, no I/O.
+
+    Wire format:
+        path   = tag_request_path(tag_name)
+        data   = UINT(type_code) + UINT(element_count) + value_bytes
+    """
+    path = tag_request_path(tag_name)
+    data = UINT.encode(type_code) + UINT.encode(element_count) + value_bytes
+    return build_cip_request(CIPService.WRITE_TAG, path, data)
+
+
+def _encode_value(dt: type[DataType[Any]], value: Any, element_count: int) -> bytes:
+    """Encode a scalar or array value to bytes for WRITE_TAG.
+
+    For arrays: each element is encoded individually (NOT via ``Array(n, dt).encode``
+    which would add a length-prefix for variable-length types).
+    """
+    if element_count == 1:
+        return dt.encode(value)
+    return b"".join(dt.encode(v) for v in value)
+
+
+def _resolve_write_type(
+    tag_name: str,
+    data_type: str | type[DataType[Any]] | None,
+    tag_info_cache: dict[str, TagInfo],
+) -> tuple[type[DataType[Any]], int, str]:
+    """Resolve (DataType, type_code, type_name) for a write.
+
+    Priority: explicit ``data_type`` kwarg > tag_info_cache lookup.
+
+    Raises:
+        DataError: type unknown, struct (Phase 2g), or not in cache.
+    """
+    if data_type is not None:
+        if isinstance(data_type, str):
+            dt = DATA_TYPES_BY_NAME.get(data_type.lower())
+            if dt is None:
+                raise DataError(f"Unknown data_type {data_type!r} for '{tag_name}'")
+        else:
+            dt = data_type
+        return dt, dt.code, dt.__name__
+
+    # No explicit type — walk the tag_info_cache
+    for base in _base_names_for(tag_name):
+        ti = tag_info_cache.get(base)
+        if ti is None:
+            continue
+        if ti.is_struct:
+            raise DataError(f"Struct writes not yet supported (Phase 2g): {tag_name!r}")
+        if ti.data_type is None:
+            raise DataError(
+                f"Cannot resolve write type for '{tag_name}': TagInfo.data_type is None"
+            )
+        dt = DATA_TYPES_BY_NAME.get(ti.data_type.lower())
+        if dt is None:
+            raise DataError(f"Unknown type name {ti.data_type!r} for '{tag_name}'")
+        return dt, dt.code, dt.__name__
+
+    raise DataError(
+        f"Cannot infer type for '{tag_name}': not in tag_info_cache. "
+        "Provide data_type= kwarg or call get_tag_list() first."
+    )
+
+
+# ---------------------------------------------------------------------------
 # LogixDriver — thin orchestration shell
 # ---------------------------------------------------------------------------
 
@@ -451,9 +555,13 @@ class LogixDriver:
         self,
         session: Session,
         send_recv: Callable[[bytes], bytes],
+        policy: WritePolicy | None = None,
     ) -> None:
         self._session = session
         self._send_recv = send_recv
+        # Each driver gets its own default WritePolicy (READ_ONLY) so arming
+        # one driver never affects another.
+        self._policy: WritePolicy = policy if policy is not None else WritePolicy()
         # Template caches — populated lazily on first struct read.
         # _handle_to_instance maps the REPLY handle (observed in a struct read
         # reply) to the template instance_id.  NOT the makeup structure_handle —
@@ -660,6 +768,242 @@ class LogixDriver:
             instance = last_instance + 1  # start AFTER last seen instance
 
         return all_tags, all_programs
+
+    # ------------------------------------------------------------------
+    # Write API
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def armed(self) -> Generator[WritePolicy, None, None]:
+        """Arm writes for the duration of this block; guarantee disarm on exit.
+
+        The context manager sets ``self._policy.mode = ARMED`` on enter and
+        reverts it (to whatever it was before) on exit — even when the body
+        raises.  ``write_tag`` never self-disarms, so all tags in the block
+        share the same armed state.
+
+        Usage::
+
+            with driver.armed():
+                driver.write_tag("ScratchDINT", 42)
+            # policy is READ_ONLY again — even if write_tag raised
+
+        Yields:
+            The WritePolicy so callers can inspect audit records::
+
+                with driver.armed() as policy:
+                    driver.write_tag("Tag", 1)
+                    print(policy.get_records())
+        """
+        policy = self._policy
+        old_mode = policy.mode
+        policy.mode = WriteMode.ARMED
+        try:
+            yield policy
+        finally:
+            policy.mode = old_mode
+
+    def write_tag(
+        self,
+        tag_name: str,
+        value: Any,
+        *,
+        data_type: str | type[DataType[Any]] | None = None,
+        element_count: int = 1,
+    ) -> Tag:
+        """Write one atomic scalar or array tag.
+
+        Must be called inside ``with driver.armed():`` — the policy's mode must
+        be ARMED or DRY_RUN.  Does NOT self-disarm; arming is context-scoped.
+
+        Struct writes and fragmented writes are Phase 2g — refused cleanly with
+        an audited DataError denial.
+
+        Bit-of-word writes (e.g. ``"MyDINT.3"``) require Read-Modify-Write and
+        are refused — an audited denial is recorded, no bytes are sent.
+
+        The write pipeline (all failures return a Tag with error set):
+            1. Bit-of-word guard (structural; no I/O)
+            2. Policy gate: mode / safety / allow-deny (no I/O)
+            3. Type resolution (DataError on struct or unknown type)
+            4. Element-count validation for arrays
+            5. Value encoding (DataError on encode failure)
+            6. Dry-run exit: build bytes, audit, return (no send)
+            7. Stage: read old value for audit record (failure is non-fatal)
+            8. Commit: send WRITE_TAG
+            9. Read-back verify in encoded domain (avoids REAL float32 trap)
+            10. Audit and return
+
+        Args:
+            tag_name:      Logix tag name (dotted paths supported for struct members).
+            value:         Value to write (scalar or list for arrays).
+            data_type:     CIP type override (string like ``"DINT"`` or DataType
+                           subclass).  Required when the tag is not in the cache.
+            element_count: 1 for scalar; must equal len(value) for arrays.
+
+        Returns:
+            Tag with status=0 on success; Tag.error describes the failure mode
+            on any error (policy denial, CIP error, or verify mismatch).
+        """
+        policy = self._policy
+        reason: str | None
+
+        # 1. BIT-OF-WORD GUARD
+        if _is_bit_of_word(tag_name):
+            reason = (
+                f"Bit-of-word write requires Read-Modify-Write (Phase 2g+): {tag_name!r}. "
+                "Use WRITE_TAG on the base word, not a bit index."
+            )
+            policy.deny(tag_name, reason)
+            return Tag(tag_name, None, 0, 0xFF, reason)
+
+        # 2. CHEAP PRE-I/O POLICY CHECKS
+        allowed, reason = policy.evaluate(tag_name)
+        if not allowed:
+            assert reason is not None
+            policy.deny(tag_name, reason)
+            return Tag(tag_name, None, 0, 0xFF, reason)
+
+        # 3. RESOLVE TYPE (no I/O — fail fast before stage read)
+        try:
+            dt, type_code, _ = _resolve_write_type(tag_name, data_type, self._tag_info_cache)
+        except DataError as exc:
+            reason = str(exc)
+            policy.deny(tag_name, reason)
+            return Tag(tag_name, None, 0, 0xFF, reason)
+
+        # 4. ELEMENT COUNT VALIDATION
+        if element_count > 1:
+            n: int = -1
+            if hasattr(value, "__len__"):
+                n = len(value)
+            if n != element_count:
+                reason = f"element_count={element_count} but value has length {n} for '{tag_name}'"
+                policy.deny(tag_name, reason)
+                return Tag(tag_name, None, type_code, 0xFF, reason)
+
+        # 5. BUILD VALUE BYTES (validate encoding before any I/O)
+        try:
+            value_bytes = _encode_value(dt, value, element_count)
+        except DataError as exc:
+            reason = str(exc)
+            policy.deny(tag_name, reason)
+            return Tag(tag_name, None, type_code, 0xFF, reason)
+
+        # 6. DRY-RUN: validate request bytes, audit, return without sending
+        if policy.mode == WriteMode.DRY_RUN:
+            _build_write_request(tag_name, type_code, element_count, value_bytes)
+            policy.audit(policy._make_record("dry_run", tag_name, value_bytes, None, None))
+            return Tag(tag_name, value, type_code, 0, None)
+
+        # 7. STAGE: read old value for audit record (non-fatal on failure)
+        old_bytes: bytes | None
+        try:
+            old_tag = self.read_tag(tag_name, element_count=element_count)
+            if old_tag.error is None and old_tag.value is not None:
+                old_bytes = _encode_value(dt, old_tag.value, element_count)
+            else:
+                old_bytes = b""
+        except Exception:
+            old_bytes = b""
+
+        # 8. COMMIT: send WRITE_TAG
+        cip_msg = _build_write_request(tag_name, type_code, element_count, value_bytes)
+        _, status, ext, _ = self._send_connected(cip_msg)
+        if status != _SUCCESS:
+            error_msg = f"WRITE_TAG '{tag_name}' failed: {decode_status(status, ext)}"
+            policy.audit(policy._make_record("denied", tag_name, value_bytes, old_bytes, error_msg))
+            return Tag(tag_name, None, type_code, status, error_msg)
+
+        # 9. READ-BACK VERIFY in encoded domain (avoids REAL float32 precision trap:
+        #    3.14 → float32 → decodes to 3.1400001 → Python "==" fails)
+        readback_bytes: bytes | None
+        try:
+            verify_tag = self.read_tag(tag_name, element_count=element_count)
+            if verify_tag.error is None and verify_tag.value is not None:
+                readback_bytes = _encode_value(dt, verify_tag.value, element_count)
+            else:
+                readback_bytes = None
+        except Exception:
+            readback_bytes = None
+
+        if readback_bytes != value_bytes:
+            reason = (
+                f"Write verify failed for '{tag_name}': "
+                f"readback {readback_bytes!r} != intended {value_bytes!r}"
+            )
+            policy.audit(
+                policy._make_record("verify_failed", tag_name, value_bytes, old_bytes, reason)
+            )
+            return Tag(tag_name, value, type_code, 0xFF, reason)
+
+        # 10. AUDIT SUCCESS
+        policy.audit(policy._make_record("committed", tag_name, value_bytes, old_bytes, None))
+        return Tag(tag_name, value, type_code, 0, None)
+
+    def write_tags(
+        self,
+        tags: list[tuple[str, Any]],
+        *,
+        data_type: str | type[DataType[Any]] | None = None,
+        element_count: int = 1,
+    ) -> list[Tag]:
+        """Write multiple atomic tags with batch critic approval.
+
+        Runs one ``critic(all_tag_names)`` before any commit — the critic sees
+        the full batch and may veto all of it (all-or-nothing at the critic
+        gate).
+
+        After critic approval, each tag is committed individually; CIP errors
+        on individual tags are captured in ``Tag.error`` and do not block
+        subsequent tags.
+
+        Arming/disarming is caller-managed (``with driver.armed():``).
+
+        Args:
+            tags:          List of ``(tag_name, value)`` pairs.
+            data_type:     CIP type override applied to every tag in the batch.
+            element_count: Element count applied to every tag.
+
+        Returns:
+            List of Tags in the same order as *tags*.
+        """
+        if not tags:
+            return []
+
+        policy = self._policy
+        tag_names = [n for n, _ in tags]
+
+        # 1. BATCH PRE-CHECKS: any refusal denies the entire batch
+        first_refusal: str | None = None
+        for name, _ in tags:
+            if _is_bit_of_word(name):
+                first_refusal = (
+                    f"Bit-of-word write in batch: {name!r} requires Read-Modify-Write (Phase 2g+)"
+                )
+                break
+            allowed, reason = policy.evaluate(name)
+            if not allowed:
+                first_refusal = reason
+                break
+
+        if first_refusal is not None:
+            policy._deny_all(tag_names, first_refusal)
+            return [Tag(n, None, 0, 0xFF, first_refusal) for n in tag_names]
+
+        # 2. CRITIC: one call, sees full batch — veto blocks all before any commit
+        if policy.critic is not None:
+            result = policy.critic(tag_names)
+            if result is not True:
+                critic_reason = result if isinstance(result, str) else "Critic denied batch"
+                policy._deny_all(tag_names, critic_reason)
+                return [Tag(n, None, 0, 0xFF, critic_reason) for n in tag_names]
+
+        # 3. PER-TAG COMMIT: individual CIP errors captured, not raised
+        return [
+            self.write_tag(name, val, data_type=data_type, element_count=element_count)
+            for name, val in tags
+        ]
 
     # ------------------------------------------------------------------
     # Template pipeline — fetch, parse, cache, decode
