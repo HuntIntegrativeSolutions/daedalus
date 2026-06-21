@@ -6,15 +6,19 @@ import struct
 
 import pytest
 from hypothesis import given
+from hypothesis import strategies as st
 
 from daedalus.cip.data_types import (
     BOOL,
     BYTE,
     DATA_TYPES_BY_CODE,
     DATA_TYPES_BY_NAME,
+    DATE,
     DATE_AND_TIME,
     DINT,
+    DT,
     DWORD,
+    ENGUNIT,
     FTIME,
     INT,
     ITIME,
@@ -34,6 +38,7 @@ from daedalus.cip.data_types import (
     STRINGN,
     TIME,
     TIME32,
+    TIME_OF_DAY,
     UDINT,
     UINT,
     ULINT,
@@ -190,8 +195,9 @@ def test_time_round_trip(v: int) -> None:
     assert TIME.decode(TIME.encode(v)) == v
 
 
-@given(sint_values)
+@given(int_values)
 def test_itime_round_trip(v: int) -> None:
+    # ITIME subclasses INT (16-bit) — use the 16-bit strategy, not 8-bit.
     assert ITIME.decode(ITIME.encode(v)) == v
 
 
@@ -210,6 +216,40 @@ def test_ldt_round_trip(v: int) -> None:
     assert LDT.decode(LDT.encode(v)) == v
 
 
+# Derived time/date types — each delegates to its integer-primitive parent.
+
+
+@given(uint_values)
+def test_date_round_trip(v: int) -> None:
+    assert DATE.decode(DATE.encode(v)) == v
+
+
+@given(udint_values)
+def test_time_of_day_round_trip(v: int) -> None:
+    assert TIME_OF_DAY.decode(TIME_OF_DAY.encode(v)) == v
+
+
+@given(ulint_values)
+def test_dt_round_trip(v: int) -> None:
+    assert DT.decode(DT.encode(v)) == v
+
+
+@given(dint_values)
+def test_stime_round_trip(v: int) -> None:
+    assert STIME.decode(STIME.encode(v)) == v
+
+
+@given(udint_values)
+def test_time32_round_trip(v: int) -> None:
+    assert TIME32.decode(TIME32.encode(v)) == v
+
+
+@given(word_array_values)
+def test_engunit_round_trip(v: list[bool]) -> None:
+    # ENGUNIT subclasses WORD (16-bit bit array).
+    assert ENGUNIT.decode(ENGUNIT.encode(v)) == v
+
+
 # ---------------------------------------------------------------------------
 # DATE_AND_TIME — 6 bytes on wire (not 8 as pycomm3 declares)
 # ---------------------------------------------------------------------------
@@ -223,6 +263,12 @@ def test_date_and_time_encodes_to_6_bytes() -> None:
 
 def test_date_and_time_round_trip() -> None:
     v = DateAndTimeValue(time_of_day=3_600_000, date=18000)
+    assert DATE_AND_TIME.decode(DATE_AND_TIME.encode(v)) == v
+
+
+@given(udint_values, uint_values)
+def test_date_and_time_round_trip_property(tod: int, date: int) -> None:
+    v = DateAndTimeValue(time_of_day=tod, date=date)
     assert DATE_AND_TIME.decode(DATE_AND_TIME.encode(v)) == v
 
 
@@ -256,13 +302,15 @@ def test_logix_string_round_trip(v: str) -> None:
     assert LOGIX_STRING.decode(LOGIX_STRING.encode(v)) == v
 
 
-def test_stringn_round_trip_utf8() -> None:
-    v = "hello world"
-    assert STRINGN.decode(STRINGN.encode(v, char_size=1)) == v
+@pytest.mark.parametrize("char_size", [1, 2, 4])
+@given(ascii_text)
+def test_stringn_round_trip(char_size: int, v: str) -> None:
+    # ASCII round-trips at every supported width (utf-8 / utf-16-le / utf-32-le).
+    assert STRINGN.decode(STRINGN.encode(v, char_size=char_size)) == v
 
 
-def test_string2_round_trip() -> None:
-    v = "hello"
+@given(ascii_text)
+def test_string2_round_trip(v: str) -> None:
     assert STRING2.decode(STRING2.encode(v)) == v
 
 
@@ -293,6 +341,29 @@ def test_stringi_round_trip_multiple_entries() -> None:
     assert result[1].text == "bonjour"
     assert result[0].language == "eng"
     assert result[1].language == "fra"
+
+
+_stringi_entries = st.lists(
+    st.builds(
+        StringIEntry,
+        text=st.text(alphabet=st.characters(min_codepoint=0x20, max_codepoint=0x7E), max_size=50),
+        language=st.text(alphabet="abcdefghijklmnopqrstuvwxyz", min_size=3, max_size=3),
+        char_set=st.integers(min_value=0, max_value=0xFFFF),
+        string_type=st.sampled_from([STRING, STRING2, SHORT_STRING]),
+    ),
+    max_size=4,
+)
+
+
+@given(_stringi_entries)
+def test_stringi_round_trip_property(entries: list[StringIEntry]) -> None:
+    result = STRINGI.decode(STRINGI.encode(entries))
+    assert len(result) == len(entries)
+    for r, e in zip(result, entries, strict=True):
+        assert r.text == e.text
+        assert r.language == e.language
+        assert r.char_set == e.char_set
+        assert r.string_type is e.string_type
 
 
 def test_stringi_empty() -> None:
