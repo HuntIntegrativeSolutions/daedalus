@@ -39,6 +39,7 @@ dev = [
     "ruff>=0.6",
     "pre-commit",
     "pydantic>=2.7",   # required so the mypy pydantic plugin is importable in dev env
+    "trio>=0.26",      # anyio trio backend for @pytest.mark.anyio
 ]
 
 [project.urls]
