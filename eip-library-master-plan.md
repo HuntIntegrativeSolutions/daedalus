@@ -238,12 +238,14 @@ Phases 0–2 are the spine; everything after is parallelizable once the sans-I/O
 |---|---|---|
 | 1 | Name / package | **`daedalus`** — LOCKED (PyPI-free, no Rockwell TM exposure) |
 | 2 | Min Python | **3.11+** (`tomllib`, `Self`, exception groups, async speedups); MicroPython = stripped sync-only extra |
-| 3 | Async lib | **anyio** (runs on asyncio + trio; its blocking portal powers the sync shim) |
+| 3 | Async lib | **anyio** (runs on asyncio + trio) for L1 async transport and L4 runtime |
 | 4 | Typed models | **pydantic v2** behind an optional `[typed]` extra, dataclass fallback. Pydantic stays **out of the L0 hot decode path** and **out of base dependencies**; it sits at L4 for validated writes, reconciliation schema, and serialization |
 | 5 | Port strategy | **Clean re-port** into fresh `src/` layout; pycomm3 vendored as the parity oracle |
 | 6 | License | **Apache-2.0** (+ NOTICE preserving pycomm3 MIT / pylogix Apache-2.0) |
-| 7 | Sync surface | **Async-first core + generated sync shim** on a persistent background loop |
+| 7 | Sync surface | **~~Async-first core + generated sync shim on a persistent background loop~~ → SUPERSEDED (Phase 3): sans-I/O generator core** (see note below) |
 | 8 | Class 1 v1 | **Consume-only first (Phase 6a), produce later (6b)** |
+
+**Decision #7 override (Phase 3, 2026-06-21).** The original sync surface — an async-first core with a generated sync shim driven through anyio's blocking portal — is superseded by a **sans-I/O generator core**. The L3 driver expresses each I/O-touching operation as a module-level generator (`_*_gen`) that `yield`s an inner CIP message and is sent back the parsed `(service, status, ext, payload)` reply; two thin runners — `_run_sync` (blocking `send_recv`) and `_run_async` (awaitable `send_recv`) — drive the *same* generators. This still guarantees a single protocol implementation (no second stack), the original goal of #7. **Why the change is non-negotiable:** a portal shim makes every synchronous call depend on a running anyio event loop, which directly breaks the decision-#2 MicroPython slim build (sync-only, no async, no anyio, L0–L3). The generator core provides a pure-sync code path with zero async dependency, so the same drivers serve both CPython (sync + async) and MicroPython (sync only). anyio remains the async library for the L1 async transport and the L4 runtime.
 
 All decisions resolved except the name. **Phase 0 + Phase 1 are ready to become the first Claude Code prompt batch.**
 

@@ -2,22 +2,27 @@
 
 Architecture note: ALL byte-building and reply-parsing lives in module-level
 pure helpers (_extract_connected_cip, _decode_read_reply, _parse_msp_reply).
-The LogixDriver class is only the thin send_recv orchestration shell so that
-Phase 3's AsyncLogixDriver can reuse every helper by re-implementing just the
-await loop — no protocol logic needs to be duplicated.
+The I/O-touching orchestration is expressed as module-level GENERATOR functions
+(``_*_gen``) that yield a CIP message and receive back the parsed reply tuple;
+two thin runners (_run_sync, _run_async) drive them.  The sync ``LogixDriver``
+and the future async driver therefore share one protocol implementation and
+cannot drift.
 
 I/O-FORBIDDEN: this module must never import socket, ssl, asyncio, anyio,
-selectors, socketserver, http, urllib, or requests.
+selectors, socketserver, http, urllib, or requests.  ``_run_async`` uses
+``async def``/``await`` but imports no async library, so the sans-I/O firewall
+(which checks imports only) stays green.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import re
 import struct
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Awaitable, Callable, Generator, Sequence
 from contextlib import contextmanager
 from io import BytesIO
-from typing import Any
+from typing import Any, TypeVar, cast
 
 from daedalus.cip.data_types import (
     BOOL,
@@ -422,7 +427,7 @@ def _build_atomic_member(
 
 
 def _base_names_for(tag_name: str) -> list[str]:
-    """Return candidate base names (longest first) for _tag_info_cache lookup.
+    """Return candidate base names (longest first) for tag_info cache lookup.
 
     Strips array subscripts ``[N]``, then walks up dotted path segments.
     Stops before eating into a ``"Program:X"`` scope prefix.
@@ -532,6 +537,649 @@ def _resolve_write_type(
 
 
 # ---------------------------------------------------------------------------
+# Driver cache state + orchestration generators (sans-I/O, shared sync/async)
+# ---------------------------------------------------------------------------
+
+# What an orchestration generator yields (an inner CIP message) and the parsed
+# reply tuple it receives back: (service, status, ext_status, payload).
+_CipReply = tuple[int, int, int, bytes]
+_T = TypeVar("_T")
+
+
+@dataclasses.dataclass
+class _DriverCaches:
+    """Lazily-populated template/tag caches for one driver instance.
+
+    The driver holds a single instance and passes it to every orchestration
+    generator, which mutate it in place.  ``handle_to_instance`` maps the reply
+    handle observed in a struct read to the template instance_id — NOT the
+    makeup structure_handle (these may differ; name-based resolution is the
+    source of truth).
+    """
+
+    template: dict[int, ResolvedTemplate]
+    handle_to_instance: dict[int, int]
+    tag_info: dict[str, TagInfo]
+
+    @classmethod
+    def empty(cls) -> _DriverCaches:
+        return cls(template={}, handle_to_instance={}, tag_info={})
+
+
+def _read_tag_gen(
+    caches: _DriverCaches,
+    tag_name: str,
+    *,
+    element_count: int = 1,
+) -> Generator[bytes, _CipReply, Tag]:
+    """Generator form of read_tag: yield the READ_TAG message, resolve any struct."""
+    path = tag_request_path(tag_name)
+    cip_msg = build_cip_request(CIPService.READ_TAG, path, UINT.encode(element_count))
+    _, status, ext, payload = yield cip_msg
+
+    if status == _PARTIAL_TRANSFER:
+        tag = yield from _read_tag_fragmented_gen(tag_name, element_count, payload)
+        return (yield from _maybe_resolve_struct_gen(caches, tag))
+    if status != _SUCCESS:
+        raise ResponseError(f"READ_TAG '{tag_name}' failed: {decode_status(status, ext)}")
+    tag = _decode_read_reply(tag_name, payload, element_count)
+    return (yield from _maybe_resolve_struct_gen(caches, tag))
+
+
+def _read_tag_fragmented_gen(
+    tag_name: str,
+    element_count: int,
+    first_payload: bytes,
+) -> Generator[bytes, _CipReply, Tag]:
+    """Accumulate READ_TAG_FRAGMENTED replies for a tag that exceeded the connection size.
+
+    The first partial reply (status 0x06 from the initial READ_TAG request) includes
+    the 2-byte type code prefix.  Continuation replies do NOT repeat the prefix.
+    The byte offset in subsequent READ_TAG_FRAGMENTED requests is a UDINT (4 bytes).
+    """
+    if len(first_payload) < 2:
+        raise DataError(
+            f"Fragmented read '{tag_name}': first payload too short ({len(first_payload)} bytes)"
+        )
+
+    type_bytes = first_payload[:2]
+    accumulated = bytearray(first_payload[2:])
+    byte_offset = len(accumulated)
+    path = tag_request_path(tag_name)
+
+    fragment_count = 0
+    while True:
+        # READ_TAG_FRAGMENTED request data: UINT(element_count) + UDINT(byte_offset)
+        data = UINT.encode(element_count) + UDINT.encode(byte_offset)
+        _, status, ext, payload = yield build_cip_request(
+            CIPService.READ_TAG_FRAGMENTED, path, data
+        )
+
+        if status == _PARTIAL_TRANSFER:
+            if not payload:
+                raise DataError(
+                    f"READ_TAG_FRAGMENTED '{tag_name}': device sent _PARTIAL_TRANSFER "
+                    f"with empty payload at byte offset {byte_offset} — aborting to "
+                    f"prevent unbounded loop (likely a firmware bug)"
+                )
+            accumulated.extend(payload)
+            byte_offset += len(payload)
+            fragment_count += 1
+            if fragment_count > _MAX_CONTINUATION_FRAGMENTS:
+                raise DataError(
+                    f"READ_TAG_FRAGMENTED '{tag_name}': exceeded "
+                    f"{_MAX_CONTINUATION_FRAGMENTS} continuation fragments "
+                    f"(byte offset {byte_offset}); aborting"
+                )
+        elif status == _SUCCESS:
+            accumulated.extend(payload)
+            break
+        else:
+            raise ResponseError(
+                f"READ_TAG_FRAGMENTED '{tag_name}' failed: {decode_status(status, ext)}"
+            )
+
+    return _decode_read_reply(tag_name, type_bytes + bytes(accumulated), element_count)
+
+
+def _read_tags_gen(
+    caches: _DriverCaches,
+    tag_names: Sequence[str],
+) -> Generator[bytes, _CipReply, list[Tag]]:
+    """Generator form of read_tags (Multiple Service Packet, service 0x0A)."""
+    if not tag_names:
+        return []
+
+    # Build individual READ_TAG sub-requests (scalar: element_count=1)
+    sub_reqs = [
+        build_cip_request(CIPService.READ_TAG, tag_request_path(n), UINT.encode(1))
+        for n in tag_names
+    ]
+
+    # MSP data layout:
+    #   UINT(count)
+    #   count x UINT(offset)  -- offsets from the count word (byte 0)
+    #   concatenated sub-requests
+    count = len(sub_reqs)
+    base = 2 + 2 * count  # count word (2) + offset table (2*count)
+    pos = 0
+    offsets: list[int] = []
+    for req in sub_reqs:
+        offsets.append(base + pos)
+        pos += len(req)
+
+    msp_data = (
+        struct.pack("<H", count)
+        + b"".join(struct.pack("<H", o) for o in offsets)
+        + b"".join(sub_reqs)
+    )
+    cip_msg = build_cip_request(CIPService.MULTIPLE_SERVICE_REQUEST, MSG_ROUTER_PATH, msp_data)
+
+    _, status, ext, payload = yield cip_msg
+    if status != _SUCCESS:
+        raise ResponseError(f"MSP failed: {decode_status(status, ext)}")
+
+    tags = _parse_msp_reply(list(tag_names), payload)
+    resolved: list[Tag] = []
+    for t in tags:
+        resolved.append((yield from _maybe_resolve_struct_gen(caches, t)))
+    return resolved
+
+
+def _get_tag_list_gen(caches: _DriverCaches) -> Generator[bytes, _CipReply, list[TagInfo]]:
+    """Generator form of get_tag_list (controller + program scopes)."""
+    result, programs = yield from _get_scope_tag_list_gen(None)
+    for prog in programs:
+        prog_tags, _ = yield from _get_scope_tag_list_gen(prog)
+        result.extend(prog_tags)
+    # Populate name→TagInfo cache so _maybe_resolve_struct_gen can bootstrap
+    # struct reads by tag name without a pre-cached reply handle.
+    caches.tag_info = {t.tag_name: t for t in result}
+    return result
+
+
+def _get_scope_tag_list_gen(
+    program: str | None,
+) -> Generator[bytes, _CipReply, tuple[list[TagInfo], list[str]]]:
+    """Enumerate one scope via the continuation loop.
+
+    Sends Get Instance Attribute List requests starting at instance 0,
+    incrementing to ``last_seen + 1`` each time the device returns
+    status 0x06 (partial transfer), until 0x00 (success / done).
+
+    Returns ``(user_tags, discovered_programs)`` for this scope only.
+    """
+    all_tags: list[TagInfo] = []
+    all_programs: list[str] = []
+    instance = 0
+    scope = program or "controller"
+    iteration = 0
+
+    while True:
+        _, status, ext, payload = yield _build_tag_list_request(instance, program)
+        if status not in (_SUCCESS, _PARTIAL_TRANSFER):
+            raise ResponseError(f"get_tag_list({scope!r}) failed: {decode_status(status, ext)}")
+
+        tags, programs, last_instance = _parse_tag_list_reply(payload, scope)
+        all_tags.extend(tags)
+        all_programs.extend(programs)
+
+        if status == _SUCCESS:
+            break
+        if last_instance < instance:
+            raise DataError(
+                f"get_tag_list({scope!r}): _PARTIAL_TRANSFER with no forward progress "
+                f"(last_instance={last_instance} is behind requested instance={instance}); "
+                f"aborting to prevent unbounded loop (likely a firmware bug)"
+            )
+        iteration += 1
+        if iteration > _MAX_CONTINUATION_FRAGMENTS:
+            raise DataError(
+                f"get_tag_list({scope!r}): exceeded {_MAX_CONTINUATION_FRAGMENTS} "
+                f"continuation iterations; aborting"
+            )
+        instance = last_instance + 1  # start AFTER last seen instance
+
+    return all_tags, all_programs
+
+
+def _write_tag_gen(
+    caches: _DriverCaches,
+    policy: WritePolicy,
+    tag_name: str,
+    value: Any,
+    *,
+    data_type: str | type[DataType[Any]] | None = None,
+    element_count: int = 1,
+) -> Generator[bytes, _CipReply, Tag]:
+    """Generator form of write_tag — full safety pipeline; arming stays external.
+
+    The WritePolicy gate (evaluate / deny / stage / commit / verify / audit)
+    lives here so the sync and async drivers share one path and cannot drift.
+    Arming is NOT performed here: write_tag is non-self-arming; the caller's
+    ``with driver.armed():`` block owns the policy mode (and its release).
+    """
+    reason: str | None
+
+    # 1. BIT-OF-WORD GUARD
+    if _is_bit_of_word(tag_name):
+        reason = (
+            f"Bit-of-word write requires Read-Modify-Write (Phase 2g+): {tag_name!r}. "
+            "Use WRITE_TAG on the base word, not a bit index."
+        )
+        policy.deny(tag_name, reason)
+        return Tag(tag_name, None, 0, 0xFF, reason)
+
+    # 2. CHEAP PRE-I/O POLICY CHECKS
+    allowed, reason = policy.evaluate(tag_name)
+    if not allowed:
+        assert reason is not None
+        policy.deny(tag_name, reason)
+        return Tag(tag_name, None, 0, 0xFF, reason)
+
+    # 3. RESOLVE TYPE (no I/O — fail fast before stage read)
+    try:
+        dt, type_code, _ = _resolve_write_type(tag_name, data_type, caches.tag_info)
+    except DataError as exc:
+        reason = str(exc)
+        policy.deny(tag_name, reason)
+        return Tag(tag_name, None, 0, 0xFF, reason)
+
+    # 4. ELEMENT COUNT VALIDATION
+    if element_count > 1:
+        n: int = -1
+        if hasattr(value, "__len__"):
+            n = len(value)
+        if n != element_count:
+            reason = f"element_count={element_count} but value has length {n} for '{tag_name}'"
+            policy.deny(tag_name, reason)
+            return Tag(tag_name, None, type_code, 0xFF, reason)
+
+    # 5. BUILD VALUE BYTES (validate encoding before any I/O)
+    try:
+        value_bytes = _encode_value(dt, value, element_count)
+    except DataError as exc:
+        reason = str(exc)
+        policy.deny(tag_name, reason)
+        return Tag(tag_name, None, type_code, 0xFF, reason)
+
+    # 6. DRY-RUN: validate request bytes, audit, return without sending
+    if policy.mode == WriteMode.DRY_RUN:
+        _build_write_request(tag_name, type_code, element_count, value_bytes)
+        policy.audit(policy._make_record("dry_run", tag_name, value_bytes, None, None))
+        return Tag(tag_name, value, type_code, 0, None)
+
+    # 7. STAGE: read old value for audit record (non-fatal on failure)
+    old_bytes: bytes | None
+    try:
+        old_tag = yield from _read_tag_gen(caches, tag_name, element_count=element_count)
+        if old_tag.error is None and old_tag.value is not None:
+            old_bytes = _encode_value(dt, old_tag.value, element_count)
+        else:
+            old_bytes = b""
+    except Exception:
+        old_bytes = b""
+
+    # 8. COMMIT: send WRITE_TAG
+    cip_msg = _build_write_request(tag_name, type_code, element_count, value_bytes)
+    _, status, ext, _ = yield cip_msg
+    if status != _SUCCESS:
+        error_msg = f"WRITE_TAG '{tag_name}' failed: {decode_status(status, ext)}"
+        policy.audit(policy._make_record("denied", tag_name, value_bytes, old_bytes, error_msg))
+        return Tag(tag_name, None, type_code, status, error_msg)
+
+    # 9. READ-BACK VERIFY in encoded domain (avoids REAL float32 precision trap:
+    #    3.14 → float32 → decodes to 3.1400001 → Python "==" fails)
+    readback_bytes: bytes | None
+    try:
+        verify_tag = yield from _read_tag_gen(caches, tag_name, element_count=element_count)
+        if verify_tag.error is None and verify_tag.value is not None:
+            readback_bytes = _encode_value(dt, verify_tag.value, element_count)
+        else:
+            readback_bytes = None
+    except Exception:
+        readback_bytes = None
+
+    if readback_bytes != value_bytes:
+        reason = (
+            f"Write verify failed for '{tag_name}': "
+            f"readback {readback_bytes!r} != intended {value_bytes!r}"
+        )
+        policy.audit(policy._make_record("verify_failed", tag_name, value_bytes, old_bytes, reason))
+        return Tag(tag_name, value, type_code, 0xFF, reason)
+
+    # 10. AUDIT SUCCESS
+    policy.audit(policy._make_record("committed", tag_name, value_bytes, old_bytes, None))
+    return Tag(tag_name, value, type_code, 0, None)
+
+
+def _write_tags_gen(
+    caches: _DriverCaches,
+    policy: WritePolicy,
+    tags: list[tuple[str, Any]],
+    *,
+    data_type: str | type[DataType[Any]] | None = None,
+    element_count: int = 1,
+) -> Generator[bytes, _CipReply, list[Tag]]:
+    """Generator form of write_tags — one critic call gates the whole batch."""
+    if not tags:
+        return []
+
+    tag_names = [n for n, _ in tags]
+
+    # 1. BATCH PRE-CHECKS: any refusal denies the entire batch
+    first_refusal: str | None = None
+    for name, _ in tags:
+        if _is_bit_of_word(name):
+            first_refusal = (
+                f"Bit-of-word write in batch: {name!r} requires Read-Modify-Write (Phase 2g+)"
+            )
+            break
+        allowed, reason = policy.evaluate(name)
+        if not allowed:
+            first_refusal = reason
+            break
+
+    if first_refusal is not None:
+        policy._deny_all(tag_names, first_refusal)
+        return [Tag(n, None, 0, 0xFF, first_refusal) for n in tag_names]
+
+    # 2. CRITIC: one call, sees full batch — veto blocks all before any commit
+    if policy.critic is not None:
+        result = policy.critic(tag_names)
+        if result is not True:
+            critic_reason = result if isinstance(result, str) else "Critic denied batch"
+            policy._deny_all(tag_names, critic_reason)
+            return [Tag(n, None, 0, 0xFF, critic_reason) for n in tag_names]
+
+    # 3. PER-TAG COMMIT: individual CIP errors captured, not raised
+    results: list[Tag] = []
+    for name, val in tags:
+        results.append(
+            (
+                yield from _write_tag_gen(
+                    caches, policy, name, val, data_type=data_type, element_count=element_count
+                )
+            )
+        )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Template pipeline generators — fetch, parse, cache, decode
+# ---------------------------------------------------------------------------
+
+
+def _fetch_template_attrs_gen(
+    instance_id: int,
+) -> Generator[bytes, _CipReply, TemplateAttributes]:
+    """Round-trip GET_ATTRIBUTE_LIST on Template Object → TemplateAttributes."""
+    _, status, ext, payload = yield _build_template_attr_request(instance_id)
+    if status != _SUCCESS:
+        raise ResponseError(
+            f"GET_ATTRIBUTE_LIST template {instance_id:#x}: {decode_status(status, ext)}"
+        )
+    return parse_template_attr_reply(payload)
+
+
+def _fetch_template_data_gen(
+    instance_id: int,
+    object_definition_size: int,
+) -> Generator[bytes, _CipReply, bytes]:
+    """Round-trip READ_TAG on Template Object with 0x06 continuation."""
+    offset = 0
+    accumulated = bytearray()
+    fragment_count = 0
+    while True:
+        cip_msg = _build_template_read_request(instance_id, object_definition_size, offset)
+        _, status, ext, payload = yield cip_msg
+        if status == _PARTIAL_TRANSFER:
+            if not payload:
+                raise DataError(
+                    f"READ_TAG template {instance_id:#x}: device sent _PARTIAL_TRANSFER "
+                    f"with empty payload at offset {offset} — aborting to prevent "
+                    f"unbounded loop (likely a firmware bug)"
+                )
+            accumulated.extend(payload)
+            offset += len(payload)
+            fragment_count += 1
+            if fragment_count > _MAX_CONTINUATION_FRAGMENTS:
+                raise DataError(
+                    f"READ_TAG template {instance_id:#x}: exceeded "
+                    f"{_MAX_CONTINUATION_FRAGMENTS} continuation fragments "
+                    f"(offset {offset}); aborting"
+                )
+        elif status == _SUCCESS:
+            accumulated.extend(payload)
+            break
+        else:
+            raise ResponseError(f"READ_TAG template {instance_id:#x}: {decode_status(status, ext)}")
+    return bytes(accumulated)
+
+
+def _get_template_gen(
+    caches: _DriverCaches,
+    instance_id: int,
+) -> Generator[bytes, _CipReply, ResolvedTemplate]:
+    """Lazily fetch, parse, and cache a ResolvedTemplate.
+
+    Recursive for nested UDTs (Logix UDTs have no cycles so depth-first
+    terminates; the cache deduplicates diamond-shaped nesting).
+
+    Note: does NOT populate handle_to_instance — that is done by
+    _maybe_resolve_struct_gen using the reply handle observed in a struct read.
+    """
+    if instance_id in caches.template:
+        return caches.template[instance_id]
+
+    attrs = yield from _fetch_template_attrs_gen(instance_id)
+    data = yield from _fetch_template_data_gen(instance_id, attrs.object_definition_size)
+    template_name, member_pairs = parse_template_data(data, attrs, instance_id)
+    is_predefined = instance_id < 0x100 or instance_id > 0xEFF
+
+    resolved_members: list[ResolvedMember] = []
+    for name, raw in member_pairs:
+        resolved_members.append((yield from _resolve_member_gen(caches, name, raw, is_predefined)))
+
+    non_private = [m for m in resolved_members if not m.is_private]
+    is_string = (
+        len(non_private) == 2
+        and [m.name for m in non_private] == ["LEN", "DATA"]
+        and non_private[1].is_array
+        and non_private[1].atomic_type is not None
+        and non_private[1].atomic_type.__name__ == "SINT"
+    )
+    string_length = non_private[1].array_length if is_string else None
+
+    template = ResolvedTemplate(
+        name=template_name,
+        structure_size=attrs.structure_size,
+        structure_handle=attrs.structure_handle,
+        members=resolved_members,
+        is_string=is_string,
+        string_length=string_length,
+    )
+    caches.template[instance_id] = template
+    return template
+
+
+def _resolve_member_gen(
+    caches: _DriverCaches,
+    name: str,
+    raw: RawMember,
+    is_predefined: bool,
+) -> Generator[bytes, _CipReply, ResolvedMember]:
+    """Resolve one RawMember — may recurse into _get_template_gen for struct members."""
+    is_private = (
+        name.startswith("ZZZZZZZZZZ")
+        or name.startswith("__")
+        or (is_predefined and name in {"CTL", "Control"})
+    )
+    typ = raw.typ
+    # Branch 1: full typ is a known atomic type code
+    dt = DATA_TYPES_BY_CODE.get(typ)
+    if dt is not None:
+        return _build_atomic_member(name, raw, dt, is_private)
+    # Branch 2: masked typ (low 12 bits) is a known atomic type code
+    dt = DATA_TYPES_BY_CODE.get(typ & 0x0FFF)
+    if dt is not None:
+        return _build_atomic_member(name, raw, dt, is_private)
+    # Branch 3: nested struct — recurse to fetch that template
+    nested_id = typ & 0x0FFF
+    nested = yield from _get_template_gen(caches, nested_id)
+    return ResolvedMember(
+        name=name,
+        offset=raw.offset,
+        is_private=is_private,
+        is_bool=False,
+        bit_number=0,
+        is_array=False,
+        array_length=0,
+        atomic_type=None,
+        nested_template=nested,
+    )
+
+
+def _maybe_resolve_struct_gen(
+    caches: _DriverCaches,
+    tag: Tag,
+) -> Generator[bytes, _CipReply, Tag]:
+    """Post-process a 0x02A0 Tag: extract reply handle, look up template, decode.
+
+    Resolution is name-based (same approach as pycomm3). The 2-byte reply handle
+    carried in the struct read response is opaque — it is NOT assumed to equal
+    the structure_handle returned by GET_ATTRIBUTE_LIST makeup. After the first
+    name-based resolution the reply handle is cached so subsequent reads of the
+    same UDT type skip the I/O bootstrap.
+
+    Scoped to whole-struct (top-level) reads for Phase 2e.
+    Nested-member-path reads (read_tag("MyTag.Inner")) fall back to raw bytes
+    gracefully — no crash.
+    """
+    if tag.type_code != _STRUCT_TYPE_CODE or tag.error is not None:
+        return tag
+    raw = tag.value
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) < 2:
+        return tag
+    reply_handle = struct.unpack_from("<H", raw, 0)[0]
+    member_data = bytes(raw[2:])
+
+    # Fast-path: reply handle was seen before and mapped to an instance_id.
+    instance_id = caches.handle_to_instance.get(reply_handle)
+
+    if instance_id is None:
+        # Name-based bootstrap: strip subscripts, walk up dotted path
+        # segments to find a TagInfo with template_instance_id set.
+        cleaned = re.sub(r"\[\d+\]", "", tag.tag_name)
+        for base in _base_names_for(tag.tag_name):
+            ti = caches.tag_info.get(base)
+            if ti is not None and ti.template_instance_id is not None:
+                if base != cleaned:
+                    # Fallback match: the tag name has a member-path
+                    # suffix beyond this cached struct entry. Applying
+                    # the parent template to the member's own struct
+                    # reply is a misparse — return raw bytes.
+                    # TODO(phase-2g): resolve the member's own template
+                    # for a full decode (e.g. STRING_40 → str), as
+                    # pycomm3 does.
+                    return tag
+                yield from _get_template_gen(caches, ti.template_instance_id)
+                # Map the REPLY handle we just observed to this instance_id.
+                instance_id = ti.template_instance_id
+                caches.handle_to_instance[reply_handle] = instance_id
+                break
+
+    if instance_id is None:
+        # Can't resolve without tag-list info — return raw bytes, no crash.
+        return tag
+
+    template = caches.template[instance_id]
+    try:
+        decoded = decode_struct(member_data, template)
+    except Exception as exc:
+        return Tag(
+            tag_name=tag.tag_name,
+            value=None,
+            type_code=tag.type_code,
+            status=0xFF,
+            error=str(exc),
+        )
+    return Tag(
+        tag_name=tag.tag_name,
+        value=decoded,
+        type_code=tag.type_code,
+        status=tag.status,
+        error=tag.error,
+        udt_name=template.name,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Runners — the ONLY difference between sync and async drivers
+# ---------------------------------------------------------------------------
+
+
+def _run_sync(
+    gen: Generator[bytes, _CipReply, _T],
+    session: Session,
+    send_recv: Callable[[bytes], bytes],
+) -> _T:
+    """Drive a sans-I/O orchestration generator with a blocking ``send_recv``.
+
+    For each yielded inner CIP message: assign the next sequence count, frame it
+    as SendUnitData, send/receive, parse the connected reply, and feed the tuple
+    back in.  On any error (including transport failure or cancellation) the
+    generator is closed so a context manager suspended across a yield runs its
+    cleanup, then the error is re-raised.
+    """
+    try:
+        cip_msg = next(gen)
+        while True:
+            seq = session.next_sequence_count()
+            frame = build_send_unit_data(
+                session_handle=session.session_handle,
+                connection_id=session.ot_connection_id,
+                sequence_count=seq,
+                message=cip_msg,
+            )
+            cip_msg = gen.send(_extract_connected_cip(send_recv(frame)))
+    except StopIteration as stop:
+        return cast(_T, stop.value)
+    except BaseException:
+        gen.close()
+        raise
+
+
+async def _run_async(
+    gen: Generator[bytes, _CipReply, _T],
+    session: Session,
+    send_recv: Callable[[bytes], Awaitable[bytes]],
+) -> _T:
+    """Drive the same generators with an awaitable ``send_recv`` (used in PR 3).
+
+    Identical to :func:`_run_sync` except the transport call is awaited.  Uses
+    ``async def``/``await`` but imports no async library, so the sans-I/O import
+    firewall stays green.  Unused until the async driver lands.
+    """
+    try:
+        cip_msg = next(gen)
+        while True:
+            seq = session.next_sequence_count()
+            frame = build_send_unit_data(
+                session_handle=session.session_handle,
+                connection_id=session.ot_connection_id,
+                sequence_count=seq,
+                message=cip_msg,
+            )
+            cip_msg = gen.send(_extract_connected_cip(await send_recv(frame)))
+    except StopIteration as stop:
+        return cast(_T, stop.value)
+    except BaseException:
+        gen.close()
+        raise
+
+
+# ---------------------------------------------------------------------------
 # LogixDriver — thin orchestration shell
 # ---------------------------------------------------------------------------
 
@@ -567,28 +1215,39 @@ class LogixDriver:
         # Each driver gets its own default WritePolicy (READ_ONLY) so arming
         # one driver never affects another.
         self._policy: WritePolicy = policy if policy is not None else WritePolicy()
-        # Template caches — populated lazily on first struct read.
-        # _handle_to_instance maps the REPLY handle (observed in a struct read
-        # reply) to the template instance_id.  NOT the makeup structure_handle —
-        # these may differ; name-based resolution is the source of truth.
-        self._template_cache: dict[int, ResolvedTemplate] = {}
-        self._handle_to_instance: dict[int, int] = {}  # reply_handle → instance_id
-        self._tag_info_cache: dict[str, TagInfo] = {}  # tag_name → TagInfo
+        # Template / tag caches — populated lazily; shared with every generator.
+        self._caches = _DriverCaches.empty()
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
-    def _send_connected(self, cip_msg: bytes) -> tuple[int, int, int, bytes]:
-        """Wrap *cip_msg* in SendUnitData, send it, return parse_cip_response tuple."""
-        seq = self._session.next_sequence_count()
-        frame = build_send_unit_data(
-            session_handle=self._session.session_handle,
-            connection_id=self._session.ot_connection_id,
-            sequence_count=seq,
-            message=cip_msg,
-        )
-        return _extract_connected_cip(self._send_recv(frame))
+    def _run(self, gen: Generator[bytes, _CipReply, _T]) -> _T:
+        """Drive *gen* to completion over this driver's blocking transport."""
+        return _run_sync(gen, self._session, self._send_recv)
+
+    # -- Backward-compat white-box seams -------------------------------
+    # The caches moved into a single _DriverCaches object and the template
+    # continuation loop moved into a module-level generator.  These thin
+    # accessors keep existing white-box tests (which poke the live cache
+    # dicts and drive the template-fetch loop directly) working unchanged;
+    # they delegate to the one shared code path, so no behavior can drift.
+
+    @property
+    def _template_cache(self) -> dict[int, ResolvedTemplate]:
+        return self._caches.template
+
+    @property
+    def _tag_info_cache(self) -> dict[str, TagInfo]:
+        return self._caches.tag_info
+
+    @property
+    def _handle_to_instance(self) -> dict[int, int]:
+        return self._caches.handle_to_instance
+
+    def _fetch_template_data(self, instance_id: int, object_definition_size: int) -> bytes:
+        """Round-trip READ_TAG on Template Object with 0x06 continuation."""
+        return self._run(_fetch_template_data_gen(instance_id, object_definition_size))
 
     # ------------------------------------------------------------------
     # Public API
@@ -613,74 +1272,7 @@ class LogixDriver:
             ResponseError: Device returned a CIP error status.
             DataError: Reply too short or contains an unknown type code.
         """
-        path = tag_request_path(tag_name)
-        cip_msg = build_cip_request(CIPService.READ_TAG, path, UINT.encode(element_count))
-        _, status, ext, payload = self._send_connected(cip_msg)
-
-        if status == _PARTIAL_TRANSFER:
-            tag = self._read_tag_fragmented(tag_name, element_count, payload)
-            return self._maybe_resolve_struct(tag)
-        if status != _SUCCESS:
-            raise ResponseError(f"READ_TAG '{tag_name}' failed: {decode_status(status, ext)}")
-        tag = _decode_read_reply(tag_name, payload, element_count)
-        return self._maybe_resolve_struct(tag)
-
-    def _read_tag_fragmented(
-        self,
-        tag_name: str,
-        element_count: int,
-        first_payload: bytes,
-    ) -> Tag:
-        """Accumulate READ_TAG_FRAGMENTED replies for a tag that exceeded the connection size.
-
-        The first partial reply (status 0x06 from the initial READ_TAG request) includes
-        the 2-byte type code prefix.  Continuation replies do NOT repeat the prefix.
-        The byte offset in subsequent READ_TAG_FRAGMENTED requests is a UDINT (4 bytes).
-        """
-        if len(first_payload) < 2:
-            raise DataError(
-                f"Fragmented read '{tag_name}': first payload too short"
-                f" ({len(first_payload)} bytes)"
-            )
-
-        type_bytes = first_payload[:2]
-        accumulated = bytearray(first_payload[2:])
-        byte_offset = len(accumulated)
-        path = tag_request_path(tag_name)
-
-        fragment_count = 0
-        while True:
-            # READ_TAG_FRAGMENTED request data: UINT(element_count) + UDINT(byte_offset)
-            data = UINT.encode(element_count) + UDINT.encode(byte_offset)
-            _, status, ext, payload = self._send_connected(
-                build_cip_request(CIPService.READ_TAG_FRAGMENTED, path, data)
-            )
-
-            if status == _PARTIAL_TRANSFER:
-                if not payload:
-                    raise DataError(
-                        f"READ_TAG_FRAGMENTED '{tag_name}': device sent _PARTIAL_TRANSFER "
-                        f"with empty payload at byte offset {byte_offset} — aborting to "
-                        f"prevent unbounded loop (likely a firmware bug)"
-                    )
-                accumulated.extend(payload)
-                byte_offset += len(payload)
-                fragment_count += 1
-                if fragment_count > _MAX_CONTINUATION_FRAGMENTS:
-                    raise DataError(
-                        f"READ_TAG_FRAGMENTED '{tag_name}': exceeded "
-                        f"{_MAX_CONTINUATION_FRAGMENTS} continuation fragments "
-                        f"(byte offset {byte_offset}); aborting"
-                    )
-            elif status == _SUCCESS:
-                accumulated.extend(payload)
-                break
-            else:
-                raise ResponseError(
-                    f"READ_TAG_FRAGMENTED '{tag_name}' failed: {decode_status(status, ext)}"
-                )
-
-        return _decode_read_reply(tag_name, type_bytes + bytes(accumulated), element_count)
+        return self._run(_read_tag_gen(self._caches, tag_name, element_count=element_count))
 
     def read_tags(self, tag_names: Sequence[str]) -> list[Tag]:
         """Read multiple tags in one Multiple Service Packet (MSP, service 0x0A).
@@ -701,40 +1293,7 @@ class LogixDriver:
             ResponseError: The MSP outer request itself failed.
             DataError: The MSP reply is malformed.
         """
-        if not tag_names:
-            return []
-
-        # Build individual READ_TAG sub-requests (scalar: element_count=1)
-        sub_reqs = [
-            build_cip_request(CIPService.READ_TAG, tag_request_path(n), UINT.encode(1))
-            for n in tag_names
-        ]
-
-        # MSP data layout:
-        #   UINT(count)
-        #   count x UINT(offset)  -- offsets from the count word (byte 0)
-        #   concatenated sub-requests
-        count = len(sub_reqs)
-        base = 2 + 2 * count  # count word (2) + offset table (2*count)
-        pos = 0
-        offsets: list[int] = []
-        for req in sub_reqs:
-            offsets.append(base + pos)
-            pos += len(req)
-
-        msp_data = (
-            struct.pack("<H", count)
-            + b"".join(struct.pack("<H", o) for o in offsets)
-            + b"".join(sub_reqs)
-        )
-        cip_msg = build_cip_request(CIPService.MULTIPLE_SERVICE_REQUEST, MSG_ROUTER_PATH, msp_data)
-
-        _, status, ext, payload = self._send_connected(cip_msg)
-        if status != _SUCCESS:
-            raise ResponseError(f"MSP failed: {decode_status(status, ext)}")
-
-        tags = _parse_msp_reply(list(tag_names), payload)
-        return [self._maybe_resolve_struct(t) for t in tags]
+        return self._run(_read_tags_gen(self._caches, tag_names))
 
     def get_tag_list(self) -> list[TagInfo]:
         """Enumerate all user tags on the controller (controller + program scopes).
@@ -753,58 +1312,7 @@ class LogixDriver:
             ResponseError: The device returned a CIP error status.
             DataError: A reply payload is malformed or truncated.
         """
-        result, programs = self._get_scope_tag_list(None)
-        for prog in programs:
-            prog_tags, _ = self._get_scope_tag_list(prog)
-            result.extend(prog_tags)
-        # Populate name→TagInfo cache so _maybe_resolve_struct can bootstrap
-        # struct reads by tag name without a pre-cached reply handle.
-        self._tag_info_cache = {t.tag_name: t for t in result}
-        return result
-
-    def _get_scope_tag_list(self, program: str | None) -> tuple[list[TagInfo], list[str]]:
-        """Enumerate one scope via the continuation loop.
-
-        Sends Get Instance Attribute List requests starting at instance 0,
-        incrementing to ``last_seen + 1`` each time the device returns
-        status 0x06 (partial transfer), until 0x00 (success / done).
-
-        Returns ``(user_tags, discovered_programs)`` for this scope only.
-        """
-        all_tags: list[TagInfo] = []
-        all_programs: list[str] = []
-        instance = 0
-        scope = program or "controller"
-        iteration = 0
-
-        while True:
-            _, status, ext, payload = self._send_connected(
-                _build_tag_list_request(instance, program)
-            )
-            if status not in (_SUCCESS, _PARTIAL_TRANSFER):
-                raise ResponseError(f"get_tag_list({scope!r}) failed: {decode_status(status, ext)}")
-
-            tags, programs, last_instance = _parse_tag_list_reply(payload, scope)
-            all_tags.extend(tags)
-            all_programs.extend(programs)
-
-            if status == _SUCCESS:
-                break
-            if last_instance < instance:
-                raise DataError(
-                    f"get_tag_list({scope!r}): _PARTIAL_TRANSFER with no forward progress "
-                    f"(last_instance={last_instance} is behind requested instance={instance}); "
-                    f"aborting to prevent unbounded loop (likely a firmware bug)"
-                )
-            iteration += 1
-            if iteration > _MAX_CONTINUATION_FRAGMENTS:
-                raise DataError(
-                    f"get_tag_list({scope!r}): exceeded {_MAX_CONTINUATION_FRAGMENTS} "
-                    f"continuation iterations; aborting"
-                )
-            instance = last_instance + 1  # start AFTER last seen instance
-
-        return all_tags, all_programs
+        return self._run(_get_tag_list_gen(self._caches))
 
     # ------------------------------------------------------------------
     # Write API
@@ -882,101 +1390,16 @@ class LogixDriver:
             Tag with status=0 on success; Tag.error describes the failure mode
             on any error (policy denial, CIP error, or verify mismatch).
         """
-        policy = self._policy
-        reason: str | None
-
-        # 1. BIT-OF-WORD GUARD
-        if _is_bit_of_word(tag_name):
-            reason = (
-                f"Bit-of-word write requires Read-Modify-Write (Phase 2g+): {tag_name!r}. "
-                "Use WRITE_TAG on the base word, not a bit index."
+        return self._run(
+            _write_tag_gen(
+                self._caches,
+                self._policy,
+                tag_name,
+                value,
+                data_type=data_type,
+                element_count=element_count,
             )
-            policy.deny(tag_name, reason)
-            return Tag(tag_name, None, 0, 0xFF, reason)
-
-        # 2. CHEAP PRE-I/O POLICY CHECKS
-        allowed, reason = policy.evaluate(tag_name)
-        if not allowed:
-            assert reason is not None
-            policy.deny(tag_name, reason)
-            return Tag(tag_name, None, 0, 0xFF, reason)
-
-        # 3. RESOLVE TYPE (no I/O — fail fast before stage read)
-        try:
-            dt, type_code, _ = _resolve_write_type(tag_name, data_type, self._tag_info_cache)
-        except DataError as exc:
-            reason = str(exc)
-            policy.deny(tag_name, reason)
-            return Tag(tag_name, None, 0, 0xFF, reason)
-
-        # 4. ELEMENT COUNT VALIDATION
-        if element_count > 1:
-            n: int = -1
-            if hasattr(value, "__len__"):
-                n = len(value)
-            if n != element_count:
-                reason = f"element_count={element_count} but value has length {n} for '{tag_name}'"
-                policy.deny(tag_name, reason)
-                return Tag(tag_name, None, type_code, 0xFF, reason)
-
-        # 5. BUILD VALUE BYTES (validate encoding before any I/O)
-        try:
-            value_bytes = _encode_value(dt, value, element_count)
-        except DataError as exc:
-            reason = str(exc)
-            policy.deny(tag_name, reason)
-            return Tag(tag_name, None, type_code, 0xFF, reason)
-
-        # 6. DRY-RUN: validate request bytes, audit, return without sending
-        if policy.mode == WriteMode.DRY_RUN:
-            _build_write_request(tag_name, type_code, element_count, value_bytes)
-            policy.audit(policy._make_record("dry_run", tag_name, value_bytes, None, None))
-            return Tag(tag_name, value, type_code, 0, None)
-
-        # 7. STAGE: read old value for audit record (non-fatal on failure)
-        old_bytes: bytes | None
-        try:
-            old_tag = self.read_tag(tag_name, element_count=element_count)
-            if old_tag.error is None and old_tag.value is not None:
-                old_bytes = _encode_value(dt, old_tag.value, element_count)
-            else:
-                old_bytes = b""
-        except Exception:
-            old_bytes = b""
-
-        # 8. COMMIT: send WRITE_TAG
-        cip_msg = _build_write_request(tag_name, type_code, element_count, value_bytes)
-        _, status, ext, _ = self._send_connected(cip_msg)
-        if status != _SUCCESS:
-            error_msg = f"WRITE_TAG '{tag_name}' failed: {decode_status(status, ext)}"
-            policy.audit(policy._make_record("denied", tag_name, value_bytes, old_bytes, error_msg))
-            return Tag(tag_name, None, type_code, status, error_msg)
-
-        # 9. READ-BACK VERIFY in encoded domain (avoids REAL float32 precision trap:
-        #    3.14 → float32 → decodes to 3.1400001 → Python "==" fails)
-        readback_bytes: bytes | None
-        try:
-            verify_tag = self.read_tag(tag_name, element_count=element_count)
-            if verify_tag.error is None and verify_tag.value is not None:
-                readback_bytes = _encode_value(dt, verify_tag.value, element_count)
-            else:
-                readback_bytes = None
-        except Exception:
-            readback_bytes = None
-
-        if readback_bytes != value_bytes:
-            reason = (
-                f"Write verify failed for '{tag_name}': "
-                f"readback {readback_bytes!r} != intended {value_bytes!r}"
-            )
-            policy.audit(
-                policy._make_record("verify_failed", tag_name, value_bytes, old_bytes, reason)
-            )
-            return Tag(tag_name, value, type_code, 0xFF, reason)
-
-        # 10. AUDIT SUCCESS
-        policy.audit(policy._make_record("committed", tag_name, value_bytes, old_bytes, None))
-        return Tag(tag_name, value, type_code, 0, None)
+        )
 
     def write_tags(
         self,
@@ -1005,234 +1428,12 @@ class LogixDriver:
         Returns:
             List of Tags in the same order as *tags*.
         """
-        if not tags:
-            return []
-
-        policy = self._policy
-        tag_names = [n for n, _ in tags]
-
-        # 1. BATCH PRE-CHECKS: any refusal denies the entire batch
-        first_refusal: str | None = None
-        for name, _ in tags:
-            if _is_bit_of_word(name):
-                first_refusal = (
-                    f"Bit-of-word write in batch: {name!r} requires Read-Modify-Write (Phase 2g+)"
-                )
-                break
-            allowed, reason = policy.evaluate(name)
-            if not allowed:
-                first_refusal = reason
-                break
-
-        if first_refusal is not None:
-            policy._deny_all(tag_names, first_refusal)
-            return [Tag(n, None, 0, 0xFF, first_refusal) for n in tag_names]
-
-        # 2. CRITIC: one call, sees full batch — veto blocks all before any commit
-        if policy.critic is not None:
-            result = policy.critic(tag_names)
-            if result is not True:
-                critic_reason = result if isinstance(result, str) else "Critic denied batch"
-                policy._deny_all(tag_names, critic_reason)
-                return [Tag(n, None, 0, 0xFF, critic_reason) for n in tag_names]
-
-        # 3. PER-TAG COMMIT: individual CIP errors captured, not raised
-        return [
-            self.write_tag(name, val, data_type=data_type, element_count=element_count)
-            for name, val in tags
-        ]
-
-    # ------------------------------------------------------------------
-    # Template pipeline — fetch, parse, cache, decode
-    # ------------------------------------------------------------------
-
-    def _fetch_template_attrs(self, instance_id: int) -> TemplateAttributes:
-        """Round-trip GET_ATTRIBUTE_LIST on Template Object → TemplateAttributes."""
-        cip_msg = _build_template_attr_request(instance_id)
-        _, status, ext, payload = self._send_connected(cip_msg)
-        if status != _SUCCESS:
-            raise ResponseError(
-                f"GET_ATTRIBUTE_LIST template {instance_id:#x}: {decode_status(status, ext)}"
+        return self._run(
+            _write_tags_gen(
+                self._caches,
+                self._policy,
+                tags,
+                data_type=data_type,
+                element_count=element_count,
             )
-        return parse_template_attr_reply(payload)
-
-    def _fetch_template_data(self, instance_id: int, object_definition_size: int) -> bytes:
-        """Round-trip READ_TAG on Template Object with 0x06 continuation."""
-        offset = 0
-        accumulated = bytearray()
-        fragment_count = 0
-        while True:
-            cip_msg = _build_template_read_request(instance_id, object_definition_size, offset)
-            _, status, ext, payload = self._send_connected(cip_msg)
-            if status == _PARTIAL_TRANSFER:
-                if not payload:
-                    raise DataError(
-                        f"READ_TAG template {instance_id:#x}: device sent _PARTIAL_TRANSFER "
-                        f"with empty payload at offset {offset} — aborting to prevent "
-                        f"unbounded loop (likely a firmware bug)"
-                    )
-                accumulated.extend(payload)
-                offset += len(payload)
-                fragment_count += 1
-                if fragment_count > _MAX_CONTINUATION_FRAGMENTS:
-                    raise DataError(
-                        f"READ_TAG template {instance_id:#x}: exceeded "
-                        f"{_MAX_CONTINUATION_FRAGMENTS} continuation fragments "
-                        f"(offset {offset}); aborting"
-                    )
-            elif status == _SUCCESS:
-                accumulated.extend(payload)
-                break
-            else:
-                raise ResponseError(
-                    f"READ_TAG template {instance_id:#x}: {decode_status(status, ext)}"
-                )
-        return bytes(accumulated)
-
-    def _get_template(self, instance_id: int) -> ResolvedTemplate:
-        """Lazily fetch, parse, and cache a ResolvedTemplate.
-
-        Recursive for nested UDTs (Logix UDTs have no cycles so depth-first
-        terminates; the cache deduplicates diamond-shaped nesting).
-
-        Note: does NOT populate _handle_to_instance — that is done by
-        _maybe_resolve_struct using the reply handle observed in a struct read.
-        """
-        if instance_id in self._template_cache:
-            return self._template_cache[instance_id]
-
-        attrs = self._fetch_template_attrs(instance_id)
-        data = self._fetch_template_data(instance_id, attrs.object_definition_size)
-        template_name, member_pairs = parse_template_data(data, attrs, instance_id)
-        is_predefined = instance_id < 0x100 or instance_id > 0xEFF
-
-        resolved_members: list[ResolvedMember] = []
-        for name, raw in member_pairs:
-            resolved_members.append(self._resolve_member(name, raw, is_predefined))
-
-        non_private = [m for m in resolved_members if not m.is_private]
-        is_string = (
-            len(non_private) == 2
-            and [m.name for m in non_private] == ["LEN", "DATA"]
-            and non_private[1].is_array
-            and non_private[1].atomic_type is not None
-            and non_private[1].atomic_type.__name__ == "SINT"
-        )
-        string_length = non_private[1].array_length if is_string else None
-
-        template = ResolvedTemplate(
-            name=template_name,
-            structure_size=attrs.structure_size,
-            structure_handle=attrs.structure_handle,
-            members=resolved_members,
-            is_string=is_string,
-            string_length=string_length,
-        )
-        self._template_cache[instance_id] = template
-        return template
-
-    def _resolve_member(
-        self,
-        name: str,
-        raw: RawMember,
-        is_predefined: bool,
-    ) -> ResolvedMember:
-        """Resolve one RawMember — may call _get_template recursively for struct members."""
-        is_private = (
-            name.startswith("ZZZZZZZZZZ")
-            or name.startswith("__")
-            or (is_predefined and name in {"CTL", "Control"})
-        )
-        typ = raw.typ
-        # Branch 1: full typ is a known atomic type code
-        dt = DATA_TYPES_BY_CODE.get(typ)
-        if dt is not None:
-            return _build_atomic_member(name, raw, dt, is_private)
-        # Branch 2: masked typ (low 12 bits) is a known atomic type code
-        dt = DATA_TYPES_BY_CODE.get(typ & 0x0FFF)
-        if dt is not None:
-            return _build_atomic_member(name, raw, dt, is_private)
-        # Branch 3: nested struct — recurse into driver to fetch that template
-        nested_id = typ & 0x0FFF
-        nested = self._get_template(nested_id)
-        return ResolvedMember(
-            name=name,
-            offset=raw.offset,
-            is_private=is_private,
-            is_bool=False,
-            bit_number=0,
-            is_array=False,
-            array_length=0,
-            atomic_type=None,
-            nested_template=nested,
-        )
-
-    def _maybe_resolve_struct(self, tag: Tag) -> Tag:
-        """Post-process a 0x02A0 Tag: extract reply handle, look up template, decode.
-
-        Resolution is name-based (same approach as pycomm3). The 2-byte reply handle
-        carried in the struct read response is opaque — it is NOT assumed to equal
-        the structure_handle returned by GET_ATTRIBUTE_LIST makeup. After the first
-        name-based resolution the reply handle is cached so subsequent reads of the
-        same UDT type skip the I/O bootstrap.
-
-        Scoped to whole-struct (top-level) reads for Phase 2e.
-        Nested-member-path reads (read_tag("MyTag.Inner")) fall back to raw bytes
-        gracefully — no crash.
-        """
-        if tag.type_code != _STRUCT_TYPE_CODE or tag.error is not None:
-            return tag
-        raw = tag.value
-        if not isinstance(raw, (bytes, bytearray)) or len(raw) < 2:
-            return tag
-        reply_handle = struct.unpack_from("<H", raw, 0)[0]
-        member_data = bytes(raw[2:])
-
-        # Fast-path: reply handle was seen before and mapped to an instance_id.
-        instance_id = self._handle_to_instance.get(reply_handle)
-
-        if instance_id is None:
-            # Name-based bootstrap: strip subscripts, walk up dotted path
-            # segments to find a TagInfo with template_instance_id set.
-            cleaned = re.sub(r"\[\d+\]", "", tag.tag_name)
-            for base in _base_names_for(tag.tag_name):
-                ti = self._tag_info_cache.get(base)
-                if ti is not None and ti.template_instance_id is not None:
-                    if base != cleaned:
-                        # Fallback match: the tag name has a member-path
-                        # suffix beyond this cached struct entry. Applying
-                        # the parent template to the member's own struct
-                        # reply is a misparse — return raw bytes.
-                        # TODO(phase-2g): resolve the member's own template
-                        # for a full decode (e.g. STRING_40 → str), as
-                        # pycomm3 does.
-                        return tag
-                    self._get_template(ti.template_instance_id)  # populate _template_cache
-                    # Map the REPLY handle we just observed to this instance_id.
-                    instance_id = ti.template_instance_id
-                    self._handle_to_instance[reply_handle] = instance_id
-                    break
-
-        if instance_id is None:
-            # Can't resolve without tag-list info — return raw bytes, no crash.
-            return tag
-
-        template = self._template_cache[instance_id]
-        try:
-            decoded = decode_struct(member_data, template)
-        except Exception as exc:
-            return Tag(
-                tag_name=tag.tag_name,
-                value=None,
-                type_code=tag.type_code,
-                status=0xFF,
-                error=str(exc),
-            )
-        return Tag(
-            tag_name=tag.tag_name,
-            value=decoded,
-            type_code=tag.type_code,
-            status=tag.status,
-            error=tag.error,
-            udt_name=template.name,
         )
