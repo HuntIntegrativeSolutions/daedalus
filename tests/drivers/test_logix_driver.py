@@ -18,6 +18,7 @@ from daedalus.drivers import LogixDriver
 from daedalus.drivers._logix import _decode_read_reply, _parse_msp_reply
 from daedalus.exceptions import DataError, ResponseError
 from daedalus.packets.encap import CPFItem, CPFTypeCode, EncapsulationHeader, build_cpf
+from daedalus.runtime.write_policy import WriteMode
 from daedalus.session import Session
 from daedalus.tag import Tag, TagInfo
 
@@ -467,3 +468,43 @@ def test_atomic_member_read_unaffected_by_struct_guard() -> None:
     tag = driver.read_tag("VFD_101_Fault[0].Code")
     assert tag.value == 42
     assert tag.type == "DINT"
+
+
+# ---------------------------------------------------------------------------
+# Ownership-release across the generator's yield points (requirement B)
+# ---------------------------------------------------------------------------
+
+
+def test_write_tag_releases_armed_mode_on_commit_error() -> None:
+    """A transport error during the COMMIT round-trip must propagate AND release.
+
+    This exercises the generator-core safety invariant: when a write is
+    interrupted mid-commit (after the stage read, while sending WRITE_TAG), the
+    runner's ``except BaseException: gen.close(); raise`` cooperates with the
+    caller's ``with driver.armed():`` ``finally`` to guarantee the policy mode is
+    restored.  Without the runner closing the suspended generator and re-raising,
+    a failed write could leave the driver armed.
+    """
+
+    class _CommBoom(Exception):
+        pass
+
+    # First send_recv (the stage read) succeeds; the second (the commit) raises.
+    stage_reply = _make_connected_reply(_make_read_reply(DINT.code, DINT.encode(0)), seq=1)
+    calls = {"n": 0}
+
+    def _send_recv(_frame: bytes) -> bytes:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return stage_reply
+        raise _CommBoom("transport died mid-commit")
+
+    driver = LogixDriver(_make_session(), _send_recv)
+
+    with pytest.raises(_CommBoom), driver.armed():
+        assert driver._policy.mode == WriteMode.ARMED
+        driver.write_tag("ScratchDINT", 42, data_type="DINT")
+
+    # The commit failed mid-flight, yet ownership was released.
+    assert driver._policy.mode == WriteMode.READ_ONLY
+    assert calls["n"] == 2  # stage read + commit attempt (commit raised)
