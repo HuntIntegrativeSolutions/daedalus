@@ -83,6 +83,11 @@ _ST_SYSTEM_FLAG: int = 0x1000
 _ST_TEMPLATE_MASK: int = 0x0FFF
 _ST_ATOMIC_MASK: int = 0x00FF
 
+# Maximum continuation fragments before aborting to prevent an unbounded loop.
+# Sized for real hardware: >4096 fragments at ~4 kB each exceeds any known
+# Logix UDT or tag-list result, so this cap is never hit on correct firmware.
+_MAX_CONTINUATION_FRAGMENTS: int = 4096
+
 
 # ---------------------------------------------------------------------------
 # Module-level pure helpers (Phase 3 reuse point — no I/O, no state)
@@ -643,6 +648,7 @@ class LogixDriver:
         byte_offset = len(accumulated)
         path = tag_request_path(tag_name)
 
+        fragment_count = 0
         while True:
             # READ_TAG_FRAGMENTED request data: UINT(element_count) + UDINT(byte_offset)
             data = UINT.encode(element_count) + UDINT.encode(byte_offset)
@@ -651,8 +657,21 @@ class LogixDriver:
             )
 
             if status == _PARTIAL_TRANSFER:
+                if not payload:
+                    raise DataError(
+                        f"READ_TAG_FRAGMENTED '{tag_name}': device sent _PARTIAL_TRANSFER "
+                        f"with empty payload at byte offset {byte_offset} — aborting to "
+                        f"prevent unbounded loop (likely a firmware bug)"
+                    )
                 accumulated.extend(payload)
                 byte_offset += len(payload)
+                fragment_count += 1
+                if fragment_count > _MAX_CONTINUATION_FRAGMENTS:
+                    raise DataError(
+                        f"READ_TAG_FRAGMENTED '{tag_name}': exceeded "
+                        f"{_MAX_CONTINUATION_FRAGMENTS} continuation fragments "
+                        f"(byte offset {byte_offset}); aborting"
+                    )
             elif status == _SUCCESS:
                 accumulated.extend(payload)
                 break
@@ -756,6 +775,7 @@ class LogixDriver:
         all_programs: list[str] = []
         instance = 0
         scope = program or "controller"
+        iteration = 0
 
         while True:
             _, status, ext, payload = self._send_connected(
@@ -770,6 +790,18 @@ class LogixDriver:
 
             if status == _SUCCESS:
                 break
+            if last_instance < instance:
+                raise DataError(
+                    f"get_tag_list({scope!r}): _PARTIAL_TRANSFER with no forward progress "
+                    f"(last_instance={last_instance} is behind requested instance={instance}); "
+                    f"aborting to prevent unbounded loop (likely a firmware bug)"
+                )
+            iteration += 1
+            if iteration > _MAX_CONTINUATION_FRAGMENTS:
+                raise DataError(
+                    f"get_tag_list({scope!r}): exceeded {_MAX_CONTINUATION_FRAGMENTS} "
+                    f"continuation iterations; aborting"
+                )
             instance = last_instance + 1  # start AFTER last seen instance
 
         return all_tags, all_programs
@@ -1028,12 +1060,26 @@ class LogixDriver:
         """Round-trip READ_TAG on Template Object with 0x06 continuation."""
         offset = 0
         accumulated = bytearray()
+        fragment_count = 0
         while True:
             cip_msg = _build_template_read_request(instance_id, object_definition_size, offset)
             _, status, ext, payload = self._send_connected(cip_msg)
             if status == _PARTIAL_TRANSFER:
+                if not payload:
+                    raise DataError(
+                        f"READ_TAG template {instance_id:#x}: device sent _PARTIAL_TRANSFER "
+                        f"with empty payload at offset {offset} — aborting to prevent "
+                        f"unbounded loop (likely a firmware bug)"
+                    )
                 accumulated.extend(payload)
                 offset += len(payload)
+                fragment_count += 1
+                if fragment_count > _MAX_CONTINUATION_FRAGMENTS:
+                    raise DataError(
+                        f"READ_TAG template {instance_id:#x}: exceeded "
+                        f"{_MAX_CONTINUATION_FRAGMENTS} continuation fragments "
+                        f"(offset {offset}); aborting"
+                    )
             elif status == _SUCCESS:
                 accumulated.extend(payload)
                 break
