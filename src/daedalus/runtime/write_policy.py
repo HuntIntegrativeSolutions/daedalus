@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import enum
 import time as _time
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -203,3 +204,21 @@ class WritePolicy:
         """Record an audited denial for every tag in a batch."""
         for name in tag_names:
             self.deny(name, reason)
+
+    @contextmanager
+    def armed(self) -> Generator[WritePolicy, None, None]:
+        """Set mode=ARMED for the block; restore prior mode on exit (even on raise).
+
+        Yields:
+            self — so callers can inspect audit records::
+
+                with driver.armed() as policy:
+                    driver.write_tag("Tag", 1)
+                    print(policy.get_records())
+        """
+        old_mode = self.mode
+        self.mode = WriteMode.ARMED
+        try:
+            yield self
+        finally:
+            self.mode = old_mode

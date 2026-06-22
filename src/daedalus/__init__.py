@@ -2,7 +2,7 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
-from daedalus.drivers import LogixDriver
+from daedalus.drivers import AsyncLogixDriver, LogixDriver
 from daedalus.runtime.write_policy import InMemorySink, WriteMode, WritePolicy, WriteRecord
 from daedalus.tag import Tag, TagInfo
 
@@ -12,6 +12,7 @@ except PackageNotFoundError:
     __version__ = "0.0.0"
 
 __all__ = [
+    "AsyncLogixDriver",
     "InMemorySink",
     "LogixDriver",
     "Tag",
