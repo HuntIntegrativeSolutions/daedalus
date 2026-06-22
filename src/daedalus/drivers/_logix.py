@@ -20,7 +20,7 @@ import dataclasses
 import re
 import struct
 from collections.abc import Awaitable, Callable, Generator, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager
 from io import BytesIO
 from typing import Any, TypeVar, cast
 
@@ -1318,35 +1318,12 @@ class LogixDriver:
     # Write API
     # ------------------------------------------------------------------
 
-    @contextmanager
-    def armed(self) -> Generator[WritePolicy, None, None]:
-        """Arm writes for the duration of this block; guarantee disarm on exit.
+    def armed(self) -> AbstractContextManager[WritePolicy]:
+        """Arm writes for the duration of a block; guarantee disarm on exit.
 
-        The context manager sets ``self._policy.mode = ARMED`` on enter and
-        reverts it (to whatever it was before) on exit — even when the body
-        raises.  ``write_tag`` never self-disarms, so all tags in the block
-        share the same armed state.
-
-        Usage::
-
-            with driver.armed():
-                driver.write_tag("ScratchDINT", 42)
-            # policy is READ_ONLY again — even if write_tag raised
-
-        Yields:
-            The WritePolicy so callers can inspect audit records::
-
-                with driver.armed() as policy:
-                    driver.write_tag("Tag", 1)
-                    print(policy.get_records())
+        Delegates to ``WritePolicy.armed()``; see that method for full docs.
         """
-        policy = self._policy
-        old_mode = policy.mode
-        policy.mode = WriteMode.ARMED
-        try:
-            yield policy
-        finally:
-            policy.mode = old_mode
+        return self._policy.armed()
 
     def write_tag(
         self,
